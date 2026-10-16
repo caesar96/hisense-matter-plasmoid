@@ -253,8 +253,12 @@ PlasmoidItem {
     fullRepresentation: ColumnLayout {
         id: full
         spacing: Kirigami.Units.largeSpacing
+        // Keep enough room that the arc and the -/+ buttons never overlap.
+        Layout.minimumWidth: 340
         Layout.preferredWidth: 360
-        Layout.preferredHeight: 600
+        // Size to content so there is no dead space under the quick actions.
+        Layout.minimumHeight: 480
+        Layout.preferredHeight: implicitHeight
 
         readonly property bool dark: Kirigami.Theme.backgroundColor.hslLightness < 0.5
         readonly property color accent: "#2f7de1"
@@ -461,8 +465,8 @@ PlasmoidItem {
                 spacing: Kirigami.Units.smallSpacing
 
                 RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
+                    Layout.alignment: Qt.AlignHCenter
+                    spacing: Kirigami.Units.largeSpacing
                     Repeater {
                         model: [
                             { icon: "media-playlist-repeat", label: qsTr("Swing") },
@@ -471,7 +475,7 @@ PlasmoidItem {
                             { icon: "brightness-high", label: qsTr("Dimmer") }
                         ]
                         delegate: ColumnLayout {
-                            Layout.fillWidth: true
+                            Layout.preferredWidth: Kirigami.Units.gridUnit * 3.4
                             spacing: Kirigami.Units.smallSpacing
                             CircleButton {
                                 Layout.alignment: Qt.AlignHCenter
@@ -480,10 +484,11 @@ PlasmoidItem {
                                 enabled: false
                             }
                             PlasmaComponents.Label {
-                                Layout.alignment: Qt.AlignHCenter
+                                Layout.fillWidth: true
                                 text: modelData.label
                                 font.pointSize: 8
                                 opacity: 0.6
+                                wrapMode: Text.WordWrap
                                 horizontalAlignment: Text.AlignHCenter
                             }
                         }
@@ -507,8 +512,6 @@ PlasmoidItem {
             wrapMode: Text.Wrap
             Layout.fillWidth: true
         }
-
-        Item { Layout.fillHeight: true }
     }
 
     toolTipMainText: "Hisense AC"

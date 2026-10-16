@@ -82,6 +82,18 @@ hisense-ac refresh             force a re-read from the device
 
 Then add the **Hisense AC** widget to your panel or desktop.
 
+## Uninstall
+
+```sh
+scripts/uninstall.sh            # keeps the commissioned state
+scripts/uninstall.sh --purge    # also deletes ~/.local/share/hisenseac
+```
+
+This stops/disables the daemon, removes the systemd user unit, uninstalls the
+plasmoid and deletes the installed binaries. The Matter fabric is kept by
+default so a re-install stays paired; `--purge` removes it as well (you will
+need to re-run `provision.sh` afterwards).
+
 ## Known limitations
 
 - **No fan-speed control.** The unit does not expose the Matter FanControl
