@@ -28,6 +28,11 @@ class Controller : public QObject
     Q_PROPERTY(double MaxSetpoint READ maxSetpoint NOTIFY stateChanged)
     Q_PROPERTY(uint NodeId READ nodeId CONSTANT)
     Q_PROPERTY(QString LastError READ lastError NOTIFY stateChanged)
+    Q_PROPERTY(bool Provisioning READ provisioning NOTIFY stateChanged)
+    Q_PROPERTY(QString ProvisionError READ provisionError NOTIFY stateChanged)
+    Q_PROPERTY(bool Unpairing READ unpairing NOTIFY stateChanged)
+    // True once a fabric exists locally; independent of the AC being reachable.
+    Q_PROPERTY(bool Commissioned READ commissioned NOTIFY stateChanged)
 
 public:
     Controller(ChipCli *cli, quint64 nodeId, QObject *parent = nullptr);
@@ -43,6 +48,10 @@ public:
     double maxSetpoint() const { return m_maxSetpoint; }
     uint nodeId() const { return static_cast<uint>(m_nodeId); }
     QString lastError() const { return m_lastError; }
+    bool provisioning() const { return m_provisioning; }
+    QString provisionError() const { return m_provisionError; }
+    bool unpairing() const { return m_unpairing; }
+    bool commissioned() const { return m_commissioned; }
 
     static int modeToSystem(const QString &mode);
     static QString systemToMode(int systemMode);
@@ -54,6 +63,13 @@ public slots:
     void SetSetpoint(double celsius);
     void SetCoolingSetpoint(double celsius);
     void SetHeatingSetpoint(double celsius);
+    // Commission the AC onto Wi-Fi and into the Matter fabric. Runs
+    // asynchronously; watch Provisioning/LastError/Connected for the result.
+    void Provision(const QString &ssid, const QString &password,
+                   const QString &code);
+    // Remove the fabric: best-effort unpair on the device plus a local wipe, so
+    // the daemon returns to the uncommissioned state. Result in ProvisionError.
+    void Unpair();
 
 signals:
     void stateChanged();
@@ -79,6 +95,12 @@ private:
     double m_minSetpoint = 16.0;
     double m_maxSetpoint = 32.0;
     QString m_lastError;
+    bool m_provisioning = false;
+    QString m_provisionError;
+    bool m_unpairing = false;
+    // A requested unpair could not reach the device; retry when it reappears.
+    bool m_unpairPending = false;
+    bool m_commissioned = false;
 
     int m_pendingReads = 0;
 };

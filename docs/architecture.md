@@ -55,6 +55,10 @@ Properties (read via `org.freedesktop.DBus.Properties`):
 | `MaxSetpoint`     | double | °C                                         |
 | `NodeId`          | uint   | Matter node id (constant)                  |
 | `LastError`       | string | last error, empty when healthy             |
+| `Provisioning`    | bool   | a pairing run is in progress               |
+| `ProvisionError`  | string | result of the last pairing run (`""` = ok) |
+| `Unpairing`       | bool   | an unpair run is in progress               |
+| `Commissioned`    | bool   | a fabric exists locally (independent of reachability) |
 
 Methods:
 
@@ -66,7 +70,28 @@ SetMode(string mode)            off|auto|cool|heat|fan|dry (only cool/heat
 SetSetpoint(double celsius)     writes cooling, or heating when in heat mode
 SetCoolingSetpoint(double c)    write OccupiedCoolingSetpoint
 SetHeatingSetpoint(double c)    write OccupiedHeatingSetpoint
+Provision(ssid, pass, code)     commission the AC onto Wi-Fi / the fabric
+Unpair()                        remove the fabric and wipe the local store
 ```
+
+`Provision` is asynchronous: the daemon takes its warm `chip-tool interactive`
+process offline (so the two never contend for the store), runs a one-shot
+`chip-tool pairing code-wifi ... --bypass-attestation-verifier 1`, then restarts
+the interactive process and refreshes. `Provisioning` flips true for the
+duration and `ProvisionError` carries the outcome. While provisioning, reads and
+writes are suppressed.
+
+`Unpair` runs `chip-tool pairing unpair` the same way, but **only wipes the
+local store if the device confirms** (otherwise the device would be left with an
+orphaned fabric, requiring a factory reset). On failure it defers: `Unpairing`
+clears, `ProvisionError` explains, and the next successful read (the device is
+back) re-invokes `Unpair`.
+
+`Connected` and `Commissioned` are deliberately separate. `Connected` means a
+read succeeded just now; `Commissioned` (derived from the fabric keys in the
+store) means we *can* talk to it. When the AC drops off Wi-Fi, `Connected` goes
+false while `Commissioned` stays true, so the UI shows a stale-state hint rather
+than the pairing form.
 
 `hisense-matterd` registers the `Controller` QObject directly with
 `QDBusConnection::registerObject(..., ExportAllSlots | ExportAllProperties |
@@ -123,6 +148,12 @@ required, or chip-tool silently creates a second fabric that the AC rejects:
 
 `scripts/provision.sh` commissions straight into the store;
 `scripts/import-current.sh` copies an existing `/tmp` commissioning into it.
+
+> A bare `chip-tool` invocation (no `--storage-directory`) writes to `/tmp`,
+> which is wiped on reboot and is a *different* fabric from the daemon's. Any
+> manual `chip-tool` command must therefore pass
+> `--storage-directory ~/.local/share/hisenseac/chip-tool`, or the daemon can no
+> longer see the commissioned device.
 
 ## Limitations carried over from the device
 

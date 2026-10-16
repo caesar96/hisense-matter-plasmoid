@@ -18,6 +18,10 @@ Controller::Controller(ChipCli *cli, quint64 nodeId, QObject *parent)
     , m_cli(cli)
     , m_nodeId(nodeId)
 {
+    // A prior commissioning is recorded by our own marker, so even if the AC
+    // is offline we know whether we can talk to it.
+    if (m_cli)
+        m_commissioned = m_cli->commissioned();
 }
 
 int Controller::modeToSystem(const QString &mode)
@@ -65,6 +69,9 @@ void Controller::setError(const QString &error)
 
 void Controller::Refresh()
 {
+    // The interactive chip-tool is offline during pairing/unpairing.
+    if (m_provisioning || m_unpairing)
+        return;
     readAll();
 }
 
@@ -94,6 +101,13 @@ void Controller::readOne(const QString &attrName, const QString &attrLabel,
     m_cli->readAttribute(QLatin1String(kCluster), attrName, attrLabel,
                          [this, target, isMode](bool ok, const QString &value) {
                              if (ok) {
+                                 // A successful read proves the device is
+                                 // commissioned (also self-heals an adopted store).
+                                 if (!m_commissioned) {
+                                     m_commissioned = true;
+                                     if (m_cli)
+                                         m_cli->setCommissioned(true);
+                                 }
                                  if (isMode) {
                                      m_systemMode = value.toInt();
                                      if (m_systemMode != 0)
@@ -103,7 +117,9 @@ void Controller::readOne(const QString &attrName, const QString &attrLabel,
                                  } else if (target) {
                                      *target = value.toDouble() * kRawToCelsius;
                                  }
-                             } else if (m_lastError.isEmpty()) {
+                             } else if (m_commissioned && m_lastError.isEmpty()) {
+                                 // Only surface read errors once we know a device
+                                 // is actually paired.
                                  setError(value);
                                  m_connected = false;
                              }
@@ -116,6 +132,10 @@ void Controller::finishRead()
     if (--m_pendingReads <= 0) {
         m_pendingReads = 0;
         emit stateChanged();
+        if (m_unpairPending && !m_unpairing && m_connected) {
+            // The AC is reachable again; finish the deferred unpair.
+            QTimer::singleShot(0, this, &Controller::Unpair);
+        }
     }
 }
 
@@ -160,8 +180,89 @@ void Controller::SetHeatingSetpoint(double celsius)
     writeHeating(celsius);
 }
 
+void Controller::Provision(const QString &ssid, const QString &password,
+                           const QString &code)
+{
+    if (m_provisioning || m_unpairing)
+        return;
+    if (ssid.isEmpty() || password.isEmpty() || code.isEmpty()) {
+        m_provisionError = QStringLiteral("SSID, Wi-Fi password and pairing code are required");
+        emit stateChanged();
+        return;
+    }
+
+    m_provisioning = true;
+    m_provisionError.clear();
+    emit stateChanged();
+
+    m_cli->runPairing(ssid, password, code, m_nodeId,
+                      [this](bool ok, const QString &message) {
+                          m_provisioning = false;
+                          if (ok) {
+                              m_commissioned = true;
+                              if (m_cli)
+                                  m_cli->setCommissioned(true);
+                          } else {
+                              const QString tail = message.section(QLatin1Char('\n'), -1).simplified();
+                              m_provisionError = tail.isEmpty()
+                                                     ? QStringLiteral("Pairing failed")
+                                                     : QStringLiteral("Pairing failed: ") + tail;
+                          }
+                          emit stateChanged();
+                          QTimer::singleShot(500, this, &Controller::Refresh);
+                      });
+}
+
+void Controller::Unpair()
+{
+    if (m_provisioning || m_unpairing)
+        return;
+    if (!m_commissioned) {
+        // Already uncommissioned; nothing to remove.
+        if (m_unpairPending || !m_provisionError.isEmpty()) {
+            m_unpairPending = false;
+            m_provisionError.clear();
+            emit stateChanged();
+        }
+        return;
+    }
+
+    m_unpairing = true;
+    m_provisionError.clear();
+    emit stateChanged();
+
+    m_cli->runUnpair(m_nodeId, [this](bool ok, const QString &message) {
+        m_unpairing = false;
+        if (ok) {
+            // Device dropped our fabric and the local store was wiped.
+            m_unpairPending = false;
+            m_commissioned = false;
+            if (m_cli)
+                m_cli->setCommissioned(false);
+            m_connected = false;
+            m_systemMode = 0;
+            m_localTemperature = 0.0;
+            m_coolingSetpoint = 0.0;
+            m_heatingSetpoint = 0.0;
+            m_lastError.clear();
+            m_provisionError.clear();
+        } else {
+            // The AC did not answer; nothing was removed. Keep the fabric and
+            // retry automatically once the device is reachable again.
+            m_unpairPending = true;
+            const QString tail = message.section(QLatin1Char('\n'), -1).simplified();
+            m_provisionError =
+                QStringLiteral("Air conditioner unreachable \u2014 will retry automatically")
+                + (tail.isEmpty() ? QString() : QStringLiteral(" (") + tail + QLatin1Char(')'));
+        }
+        emit stateChanged();
+    });
+}
+
 void Controller::writeMode(int systemMode)
 {
+    if (m_provisioning || m_unpairing)
+        return;
     // Known quirk: setting a setpoint while the unit is off can be reverted on
     // power-on, so power/mode changes are applied first, then a refresh reads
     // the authoritative state back.
@@ -186,6 +287,8 @@ void Controller::writeMode(int systemMode)
 
 void Controller::writeCooling(double celsius)
 {
+    if (m_provisioning || m_unpairing)
+        return;
     const int raw = qRound(celsius / kRawToCelsius);
     m_cli->writeAttribute(QLatin1String(kCluster),
                           QStringLiteral("occupied-cooling-setpoint"),
@@ -204,6 +307,8 @@ void Controller::writeCooling(double celsius)
 
 void Controller::writeHeating(double celsius)
 {
+    if (m_provisioning || m_unpairing)
+        return;
     const int raw = qRound(celsius / kRawToCelsius);
     m_cli->writeAttribute(QLatin1String(kCluster),
                           QStringLiteral("occupied-heating-setpoint"),

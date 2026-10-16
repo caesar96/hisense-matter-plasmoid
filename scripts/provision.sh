@@ -29,11 +29,19 @@ fi
 command -v "$CHIP_TOOL" >/dev/null || { echo "chip-tool not found" >&2; exit 1; }
 
 mkdir -p "$STORE"
+# Start from a clean slate so a previous fabric can't interfere.
+rm -f "$STORE"/chip_tool_config*.ini "$STORE"/chip_tool_kvs \
+      "$STORE"/chip_config.ini "$STORE"/chip_factory.ini \
+      "$STORE"/chip_counters.ini "$STORE/.commissioned"
 echo ">> commissioning node $NODE_ID into $STORE"
 
 # NOTE: chip-tool expects global options at the END of the argument list.
 "$CHIP_TOOL" pairing code-wifi "$NODE_ID" "$SSID" "$PASS" "$CODE" \
     --bypass-attestation-verifier 1 \
     --storage-directory "$STORE"
+
+# Tell the daemon a device is paired (it keys off this marker, not chip-tool's
+# fabric keys, which always include the controller's own fabric).
+printf '1' > "$STORE/.commissioned"
 
 echo ">> done. Verify with: hisense-ac status"

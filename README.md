@@ -57,11 +57,46 @@ The manual pairing code is the numeric code on the unit/QR. State is written to
 a **persistent** store (`~/.local/share/hisenseac/chip-tool`) instead of the
 default volatile `/tmp`, so the commissioning survives reboots.
 
+You can also pair straight from the widget: while the AC is not connected the
+expanded popup shows a **Connect the air conditioner** form (SSID, Wi-Fi
+password, pairing code). Those values are only used for this one-time pairing
+and are never written to disk.
+
+CLI equivalent:
+
+```sh
+hisense-ac provision "<ssid>" "<wifi-password>" "<pairing-code>"
+```
+
+
 Already paired with plain `chip-tool` (state in `/tmp`)? Adopt it with:
 
 ```sh
 scripts/import-current.sh
 ```
+
+> **Careful:** a bare `chip-tool` command writes its controller state to the
+> default `/tmp` location, which is forgotten on reboot and does **not** match
+> the daemon's fabric. If you drive `chip-tool` yourself, always pass
+> `--storage-directory ~/.local/share/hisenseac/chip-tool` (or just use the
+> widget / `hisense-ac provision`).
+
+### Starting over / forgetting the AC
+
+To un-pair and return to the Setup form, use the **Forget air conditioner**
+button at the bottom of the popup (click it twice to confirm). The daemon asks
+the device to drop the fabric, and only then wipes its local store:
+
+```sh
+hisense-ac unpair
+```
+
+The local fabric is removed **only after the AC confirms** the unpair — so the
+device never ends up holding an orphaned fabric. If the AC is unreachable at
+that moment, nothing is removed and the daemon retries automatically as soon as
+the AC is reachable again (shown as a message in the widget). You only need a
+factory reset of the AC itself (its Wi-Fi/reset button) if the unit is
+permanently gone or was hard-reset.
 
 ## Running
 
@@ -78,9 +113,18 @@ hisense-ac on | off            turn the AC on (last mode) / off
 hisense-ac mode <mode>         off|auto|cool|heat|fan|dry
 hisense-ac setpoint <celsius>  set the active setpoint
 hisense-ac refresh             force a re-read from the device
+hisense-ac provision "<ssid>" "<wifi-password>" "<pairing-code>"
+                               commission the AC (needs it in pairing mode)
+hisense-ac unpair              remove the pairing and forget local state
 ```
 
 Then add the **Hisense AC** widget to your panel or desktop.
+
+The widget distinguishes *commissioned* (paired — the pairing persists in the
+fabric store) from *reachable* (answering right now). Once paired, the controls
+stay available even while the AC is powered off; if the unit drops off Wi-Fi the
+widget keeps showing the last known state with an **offline** hint instead of
+asking you to pair again.
 
 ## Uninstall
 

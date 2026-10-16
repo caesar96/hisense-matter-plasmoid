@@ -41,6 +41,24 @@ public:
     void writeAttribute(const QString &cluster, const QString &attrName,
                         const QString &value, Callback cb);
 
+    // Runs a one-shot `chip-tool pairing code-wifi ...`. The interactive
+    // process is taken offline first (so the two never contend for the store)
+    // and restarted before the callback fires. cb receives a human-readable
+    // message (chip-tool output or an error).
+    void runPairing(const QString &ssid, const QString &password,
+                    const QString &code, quint64 nodeId, Callback cb);
+
+    // Removes the fabric: runs `chip-tool pairing unpair` and, only if the
+    // device confirms, wipes the local store; then restarts the interactive
+    // process. cb receives chip-tool's output (or an error).
+    void runUnpair(quint64 nodeId, Callback cb);
+
+    // Our own marker for "a device has been commissioned". chip-tool always
+    // creates its own default controller fabric in the store, so the presence
+    // of fabric keys is NOT a reliable signal; we track it explicitly.
+    bool commissioned() const;
+    void setCommissioned(bool on);
+
 private slots:
     void onReadyReadStdout();
     void onReadyReadStderr();
@@ -56,6 +74,7 @@ private:
         int timeoutMs = 12000;
     };
 
+    QString markerPath() const;
     void enqueue(Job job);
     void sendNext();
     void failCurrent(const QString &reason);
@@ -64,6 +83,7 @@ private:
     static QString stripAnsi(const QString &s);
 
     QProcess m_proc;
+    QProcess *m_pairProc = nullptr;
     QTimer m_timeout;
     QQueue<Job> m_queue;
     Job m_current;

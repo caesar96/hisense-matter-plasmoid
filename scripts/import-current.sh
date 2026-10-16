@@ -35,6 +35,10 @@ if [[ "$found" -eq 0 ]]; then
     exit 1
 fi
 
+# Record that a device is paired (the daemon uses this marker, not the presence
+# of chip-tool fabric keys, which always include the controller's own fabric).
+printf '1' > "$STORE/.commissioned"
+
 echo ">> imported into $STORE"
 echo ">> NOTE: chip-tool resolves some paths literally under /tmp; keep $SRC"
 echo ">>       around or re-run scripts/provision.sh for a self-contained store."

@@ -2,6 +2,9 @@
 #include "chipcli.h"
 
 #include <QDebug>
+#include <QDir>
+#include <QFile>
+#include <QSharedPointer>
 
 namespace {
 // Chip-tool colours its logging; strip the escape sequences before matching.
@@ -36,6 +39,33 @@ bool ChipCli::isRunning() const
     return m_proc.state() == QProcess::Running;
 }
 
+QString ChipCli::markerPath() const
+{
+    if (m_storageDir.isEmpty())
+        return {};
+    return QDir(m_storageDir).filePath(QStringLiteral(".commissioned"));
+}
+
+bool ChipCli::commissioned() const
+{
+    const QString path = markerPath();
+    return !path.isEmpty() && QFile::exists(path);
+}
+
+void ChipCli::setCommissioned(bool on)
+{
+    const QString path = markerPath();
+    if (path.isEmpty())
+        return;
+    if (on) {
+        QFile file(path);
+        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            file.write("1");
+    } else {
+        QFile::remove(path);
+    }
+}
+
 void ChipCli::start()
 {
     if (isRunning())
@@ -59,8 +89,11 @@ void ChipCli::stop()
     m_busy = false;
     if (m_proc.state() != QProcess::NotRunning) {
         m_proc.write("exit\n");
-        if (!m_proc.waitForFinished(2000))
+        if (!m_proc.waitForFinished(2000)) {
             m_proc.kill();
+            // Make sure it is really gone before anyone else touches the store.
+            m_proc.waitForFinished(2000);
+        }
     }
 }
 
@@ -90,6 +123,111 @@ void ChipCli::writeAttribute(const QString &cluster, const QString &attrName,
         QStringLiteral("status = 0x[0-9a-fA-F]+\\s*\\((SUCCESS|FAILURE[^)]*)\\)"));
     job.cb = std::move(cb);
     enqueue(std::move(job));
+}
+
+void ChipCli::runPairing(const QString &ssid, const QString &password,
+                         const QString &code, quint64 nodeId, Callback cb)
+{
+    // Let go of the interactive process so it cannot rewrite the store on exit
+    // (and clobber the freshly written fabric) while pairing runs.
+    stop();
+
+    // Commission from a clean slate so leftovers from failed attempts (or a
+    // half-removed fabric) cannot confuse the new commissioning.
+    if (!m_storageDir.isEmpty()) {
+        QDir(m_storageDir).removeRecursively();
+        QDir().mkpath(m_storageDir);
+    }
+
+    auto *p = new QProcess(this);
+    m_pairProc = p;
+
+    QStringList args;
+    // chip-tool wants global options LAST.
+    args << QStringLiteral("pairing") << QStringLiteral("code-wifi")
+         << QString::number(nodeId) << ssid << password << code
+         << QStringLiteral("--bypass-attestation-verifier") << QStringLiteral("1");
+    if (!m_storageDir.isEmpty())
+        args << QStringLiteral("--storage-directory") << m_storageDir;
+
+    p->setProcessChannelMode(QProcess::MergedChannels);
+
+    // finished() is not emitted when the process fails to start, so both
+    // signal paths funnel through a once-guard.
+    auto done = QSharedPointer<bool>::create(false);
+    auto finish = [this, p, cb, done](bool ok, const QString &message) {
+        if (*done)
+            return;
+        *done = true;
+        p->deleteLater();
+        if (m_pairProc == p)
+            m_pairProc = nullptr;
+        start(); // bring the interactive process back up
+        if (cb)
+            cb(ok, message);
+    };
+
+    connect(p, &QProcess::finished, this,
+            [p, finish](int exitCode, QProcess::ExitStatus status) {
+                const QString out =
+                    stripAnsi(QString::fromUtf8(p->readAll())).trimmed();
+                finish(status == QProcess::NormalExit && exitCode == 0, out);
+            });
+    connect(p, &QProcess::errorOccurred, this,
+            [p, finish](QProcess::ProcessError) {
+                finish(false, p->errorString());
+            });
+    p->start(m_chipTool, args);
+}
+
+void ChipCli::runUnpair(quint64 nodeId, Callback cb)
+{
+    // The interactive process holds the store; stop it first.
+    stop();
+
+    auto *p = new QProcess(this);
+    m_pairProc = p;
+
+    QStringList args;
+    args << QStringLiteral("pairing") << QStringLiteral("unpair")
+         << QString::number(nodeId);
+    if (!m_storageDir.isEmpty())
+        args << QStringLiteral("--storage-directory") << m_storageDir;
+
+    p->setProcessChannelMode(QProcess::MergedChannels);
+
+    auto done = QSharedPointer<bool>::create(false);
+    auto finish = [this, p, cb, done](bool ok, const QString &message) {
+        if (*done)
+            return;
+        *done = true;
+        p->deleteLater();
+        if (m_pairProc == p)
+            m_pairProc = nullptr;
+        // Only drop the local fabric once the device has confirmed it removed
+        // ours. Wiping on failure would orphan the device's fabric and force a
+        // factory reset, so on failure we keep everything and let the caller
+        // retry once the AC is reachable again.
+        if (ok && !m_storageDir.isEmpty()) {
+            QDir(m_storageDir).removeRecursively();
+            QDir().mkpath(m_storageDir);
+        }
+        start(); // bring the interactive process back up
+        if (cb)
+            cb(ok, message);
+    };
+
+    connect(p, &QProcess::finished, this,
+            [p, finish](int exitCode, QProcess::ExitStatus status) {
+                const QString out =
+                    stripAnsi(QString::fromUtf8(p->readAll())).trimmed();
+                finish(status == QProcess::NormalExit && exitCode == 0, out);
+            });
+    connect(p, &QProcess::errorOccurred, this,
+            [p, finish](QProcess::ProcessError) {
+                finish(false, p->errorString());
+            });
+    p->start(m_chipTool, args);
 }
 
 void ChipCli::enqueue(Job job)

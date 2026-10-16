@@ -74,9 +74,14 @@ int printStatus(bool json)
         o.insert(QStringLiteral("maxSetpoint"), maxS.toDouble());
         o.insert(QStringLiteral("nodeId"), int(nodeId.toUInt()));
         o.insert(QStringLiteral("lastError"), lastError.toString());
+        o.insert(QStringLiteral("provisioning"), prop("Provisioning").toBool());
+        o.insert(QStringLiteral("provisionError"), prop("ProvisionError").toString());
+        o.insert(QStringLiteral("unpairing"), prop("Unpairing").toBool());
+        o.insert(QStringLiteral("commissioned"), prop("Commissioned").toBool());
         out() << QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)) << '\n';
     } else {
         out() << "connected:        " << (connected.toBool() ? "yes" : "no") << '\n';
+        out() << "commissioned:     " << (prop("Commissioned").toBool() ? "yes" : "no") << '\n';
         out() << "power:            " << (power.toBool() ? "on" : "off") << '\n';
         out() << "mode:             " << mode.toString() << " (" << systemMode.toUInt() << ")\n";
         out() << "local temp:       " << localTemp.toDouble() << " C\n";
@@ -114,7 +119,10 @@ void usage()
              "  on | off             turn the AC on (last mode) / off\n"
              "  mode <mode>          off|auto|cool|heat|fan|dry\n"
              "  setpoint <celsius>   set the active setpoint\n"
-             "  refresh              force the daemon to re-read the device\n";
+             "  refresh              force the daemon to re-read the device\n"
+             "  provision <ssid> <wifi-password> <pairing-code>\n"
+             "                       commission the AC (needs it in pairing mode)\n"
+             "  unpair               remove the pairing and forget local state\n";
     out().flush();
 }
 } // namespace
@@ -140,6 +148,8 @@ int main(int argc, char *argv[])
         return call("SetPower", {false});
     if (cmd == QLatin1String("refresh"))
         return call("Refresh", {});
+    if (cmd == QLatin1String("unpair"))
+        return call("Unpair", {});
     if (cmd == QLatin1String("mode")) {
         if (args.size() < 3) {
             err() << "mode requires an argument\n";
@@ -159,6 +169,13 @@ int main(int argc, char *argv[])
             return 2;
         }
         return call("SetSetpoint", {value});
+    }
+    if (cmd == QLatin1String("provision")) {
+        if (args.size() < 5) {
+            err() << "provision requires <ssid> <wifi-password> <pairing-code>\n";
+            return 2;
+        }
+        return call("Provision", {args.at(2), args.at(3), args.at(4)});
     }
 
     usage();

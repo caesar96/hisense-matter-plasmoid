@@ -14,6 +14,7 @@ PlasmoidItem {
 
     // ---- state -----------------------------------------------------------
     property bool connected: false
+    property bool commissioned: false
     property bool power: false
     property string mode: "off"
     property real setpoint: 25
@@ -21,6 +22,18 @@ PlasmoidItem {
     property real minSetpoint: 16
     property real maxSetpoint: 32
     property string lastError: ""
+    property bool provisioning: false
+    property bool unpairing: false
+    property string provisionError: ""
+    property string provError: ""
+    property bool confirmForget: false
+    // Optimistic feedback: show "Forgetting…" the moment the button is pressed
+    // instead of waiting for the daemon to report the in-progress flag.
+    property bool forgetting: false
+    property bool _sawUnpairing: false
+    // Optimistic feedback: show "Pairing…" the moment the button is pressed,
+    // and keep polling briskly until the daemon reports the outcome.
+    property bool pairingRequested: false
 
     // Optimistic UI: a command updates the display immediately and is rolled
     // back if the device rejects it (or never confirms).
@@ -47,10 +60,33 @@ PlasmoidItem {
         try {
             const s = JSON.parse(text)
             connected = s.connected
+            commissioned = s.commissioned === true
             localTemp = s.localTemperature
             minSetpoint = s.minSetpoint
             maxSetpoint = s.maxSetpoint
             lastError = s.lastError
+            provisioning = s.provisioning === true
+            unpairing = s.unpairing === true
+            provisionError = s.provisionError || ""
+
+            // Once the daemon has finished (commissioned the AC or reported an
+            // error) drop the optimistic "pairing" state.
+            if (pairingRequested && !provisioning
+                    && (commissioned || provisionError.length > 0)) {
+                pairingRequested = false
+                pairStallTimer.stop()
+            }
+
+            if (forgetting) {
+                if (unpairing)
+                    _sawUnpairing = true
+                else if (_sawUnpairing || !commissioned) {
+                    // Unpair finished (either way) or the fabric is gone.
+                    forgetting = false
+                    _sawUnpairing = false
+                    forgetTimer.stop()
+                }
+            }
 
             _devPower = s.power
             _devMode = s.mode
@@ -129,15 +165,67 @@ PlasmoidItem {
         send(on ? "on" : "off")
     }
 
+    // Single-quote a value for the shell the executable engine runs commands in.
+    function _shq(s) {
+        return "'" + String(s).replace(/'/g, "'\\''") + "'"
+    }
+
+    function provision(ssid, password, code) {
+        if (ssid.length === 0 || password.length === 0 || code.length === 0) {
+            provError = qsTr("Enter the Wi-Fi name, password and pairing code.")
+            return
+        }
+        provError = ""
+        pairingRequested = true
+        pairStallTimer.restart()
+        cmdSource.run(root.shellPrefix + root.acCommand + " provision "
+                      + _shq(ssid) + " " + _shq(password) + " " + _shq(code), ok => {
+            if (!ok) {
+                provError = qsTr("Could not reach the daemon (is hisense-matterd running?)")
+                pairingRequested = false
+                pairStallTimer.stop()
+            }
+        })
+        refreshTimer.remaining = 10
+        refreshTimer.restart()
+    }
+
+    function forget() {
+        provError = ""
+        confirmForget = false
+        forgetting = true
+        _sawUnpairing = false
+        forgetTimer.restart()
+        cmdSource.run(root.shellPrefix + root.acCommand + " unpair", ok => {
+            if (!ok) {
+                provError = qsTr("Could not reach the daemon (is hisense-matterd running?)")
+                forgetting = false
+                forgetTimer.stop()
+            }
+        })
+        refreshTimer.remaining = 10
+        refreshTimer.restart()
+    }
+
     Plasma5Support.DataSource {
         id: statusSource
         engine: "executable"
         connectedSources: [root.statusCommand]
-        interval: 10000
         onNewData: (source, data) => {
             if (data["exit code"] === 0 && data.stdout)
                 root.applyStatus(data.stdout)
         }
+    }
+
+    // Always poll the daemon so the UI tracks it even when no command was
+    // issued (the DataSource itself only runs once per connect).
+    Timer {
+        id: pollTimer
+        interval: 10000
+        repeat: true
+        running: true
+        triggeredOnStart: true
+        onTriggered: root.refresh()
     }
 
     // One-shot command runner: connect, collect, disconnect.
@@ -199,6 +287,26 @@ PlasmoidItem {
         }
     }
 
+    // Lapse the "really forget?" confirmation state after a few seconds.
+    Timer {
+        id: confirmTimer
+        interval: 4000
+        repeat: false
+        onTriggered: root.confirmForget = false
+    }
+
+    // Safety net so the button never stays stuck on "Forgetting…".
+    Timer {
+        id: forgetTimer
+        interval: 30000
+        repeat: false
+        onTriggered: {
+            root.forgetting = false
+            root._sawUnpairing = false
+            root.refresh()
+        }
+    }
+
     // If the device never confirms the optimistic change, settle on whatever
     // the device actually reports (a rollback).
     Timer {
@@ -222,6 +330,27 @@ PlasmoidItem {
         refreshTimer.restart()
     }
 
+    // Keep polling while the daemon reports a pairing in progress (it can take
+    // a minute or two).
+    Timer {
+        id: provisionPoller
+        interval: 1000
+        repeat: true
+        running: root.provisioning || root.pairingRequested
+        onTriggered: root.refresh()
+    }
+
+    // Safety net so the Pair button never stays stuck on "Pairing…".
+    Timer {
+        id: pairStallTimer
+        interval: 180000
+        repeat: false
+        onTriggered: {
+            root.pairingRequested = false
+            root.refresh()
+        }
+    }
+
     // ---- representations ----
     compactRepresentation: Item {
         id: compact
@@ -236,11 +365,13 @@ PlasmoidItem {
             anchors.centerIn: parent
             spacing: Kirigami.Units.smallSpacing
             PlasmaComponents.Label {
-                text: root.localTemp.toFixed(0) + "\u00B0"
+                text: root.commissioned ? root.localTemp.toFixed(0) + "\u00B0" : "\u2014"
                 font.bold: true
             }
             PlasmaComponents.Label {
-                text: root.power ? root.cap(root.mode) : "Off"
+                text: !root.commissioned ? qsTr("Not set up")
+                    : (!root.connected ? qsTr("Offline")
+                                       : (root.power ? root.cap(root.mode) : qsTr("Off")))
                 opacity: 0.8
             }
         }
@@ -270,8 +401,112 @@ PlasmoidItem {
                                                   Kirigami.Theme.textColor.b,
                                                   dark ? 0.16 : 0.09)
 
+        // ---- offline hint (paired, but the AC is not answering) --------
+        PlasmaComponents.Label {
+            Layout.fillWidth: true
+            visible: root.commissioned && !root.connected && root.provisionError.length === 0
+            text: qsTr("\u26A0 Air conditioner offline \u2014 showing its last known state. Check power and Wi-Fi.")
+            color: "#e0a251"
+            wrapMode: Text.WordWrap
+            font.pointSize: 8
+        }
+
+        // ---- setup (shown until the AC has been commissioned) ----------
+        Rectangle {
+            visible: !root.commissioned
+            Layout.fillWidth: true
+            Layout.preferredHeight: setupCol.implicitHeight + Kirigami.Units.largeSpacing * 2
+            radius: Kirigami.Units.largeSpacing
+            color: full.cardColor
+            border.width: 1
+            border.color: full.hairline
+
+            ColumnLayout {
+                id: setupCol
+                anchors.fill: parent
+                anchors.margins: Kirigami.Units.largeSpacing
+                spacing: Kirigami.Units.smallSpacing
+
+                PlasmaComponents.Label {
+                    Layout.fillWidth: true
+                    text: qsTr("Connect the air conditioner")
+                    font.bold: true
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    PlasmaComponents.Label {
+                        Layout.fillWidth: true
+                        text: qsTr("1. Put the AC in pairing mode: hold its Wi-Fi button ~3 s until the Wi-Fi icon blinks.")
+                        opacity: 0.6
+                        font.pointSize: 8
+                        wrapMode: Text.WordWrap
+                    }
+                    PlasmaComponents.Label {
+                        Layout.fillWidth: true
+                        text: qsTr("2. Use a 2.4 GHz Wi-Fi network.")
+                        opacity: 0.6
+                        font.pointSize: 8
+                        wrapMode: Text.WordWrap
+                    }
+                    PlasmaComponents.Label {
+                        Layout.fillWidth: true
+                        text: qsTr("3. Enter the Wi-Fi name and password, then the pairing code (on the unit or its QR card).")
+                        opacity: 0.6
+                        font.pointSize: 8
+                        wrapMode: Text.WordWrap
+                    }
+                }
+                PlasmaComponents.TextField {
+                    id: ssidField
+                    Layout.fillWidth: true
+                    placeholderText: qsTr("Wi-Fi name (SSID)")
+                }
+                PlasmaComponents.TextField {
+                    id: passField
+                    Layout.fillWidth: true
+                    placeholderText: qsTr("Wi-Fi password")
+                    echoMode: TextInput.Password
+                }
+                PlasmaComponents.TextField {
+                    id: codeField
+                    Layout.fillWidth: true
+                    placeholderText: qsTr("Pairing code")
+                    inputMethodHints: Qt.ImhDigitsOnly
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.smallSpacing
+                    PlasmaComponents.BusyIndicator {
+                        Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                        Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                        running: root.provisioning || root.pairingRequested
+                        visible: running
+                    }
+                    PlasmaComponents.Button {
+                        Layout.fillWidth: true
+                        text: (root.provisioning || root.pairingRequested)
+                              ? qsTr("Pairing\u2026") : qsTr("Pair")
+                        enabled: !(root.provisioning || root.pairingRequested)
+                                 && ssidField.text.length > 0
+                                 && passField.text.length > 0 && codeField.text.length > 0
+                        onClicked: root.provision(ssidField.text, passField.text, codeField.text)
+                    }
+                }
+                PlasmaComponents.Label {
+                    Layout.fillWidth: true
+                    visible: text.length > 0
+                    text: root.provError.length > 0 ? root.provError : root.provisionError
+                    color: "#e05151"
+                    wrapMode: Text.Wrap
+                    font.pointSize: 8
+                }
+            }
+        }
+
         // ---- main card -------------------------------------------------
         Rectangle {
+            visible: root.commissioned
             Layout.fillWidth: true
             Layout.preferredHeight: mainCol.implicitHeight + Kirigami.Units.largeSpacing * 2
             radius: Kirigami.Units.largeSpacing
@@ -451,6 +686,7 @@ PlasmoidItem {
 
         // ---- quick actions ----
         Rectangle {
+            visible: root.commissioned
             Layout.fillWidth: true
             Layout.preferredHeight: quickCol.implicitHeight + Kirigami.Units.largeSpacing * 2
             radius: Kirigami.Units.largeSpacing
@@ -506,16 +742,47 @@ PlasmoidItem {
         }
 
         PlasmaComponents.Label {
-            visible: root.lastError.length > 0
-            text: root.lastError
+            visible: text.length > 0
+            text: (root.connected && root.lastError.length > 0)
+                ? root.lastError
+                : (root.commissioned ? root.provisionError : "")
             color: "#e05151"
             wrapMode: Text.Wrap
             Layout.fillWidth: true
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            visible: root.connected
+            spacing: Kirigami.Units.smallSpacing
+            PlasmaComponents.BusyIndicator {
+                Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                running: root.unpairing || root.forgetting
+                visible: running
+            }
+            PlasmaComponents.Button {
+                Layout.fillWidth: true
+                flat: true
+                icon.name: "edit-delete"
+                text: (root.unpairing || root.forgetting) ? qsTr("Forgetting\u2026")
+                    : (root.confirmForget ? qsTr("Click again to remove the pairing")
+                                          : qsTr("Forget air conditioner"))
+                enabled: !root.unpairing && !root.forgetting && !root.provisioning
+                onClicked: {
+                    if (root.confirmForget) {
+                        root.forget()
+                    } else {
+                        root.confirmForget = true
+                        confirmTimer.restart()
+                    }
+                }
+            }
         }
     }
 
     toolTipMainText: "Hisense AC"
     toolTipSubText: root.connected
         ? (root.localTemp.toFixed(1) + " \u00B0C, " + (root.power ? root.cap(root.mode) : "Off"))
-        : "Daemon unavailable"
+        : (root.commissioned ? qsTr("Offline") : qsTr("Not paired"))
 }
