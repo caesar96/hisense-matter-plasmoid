@@ -1,0 +1,14 @@
+[Unit]
+Description=Hisense Matter air conditioner daemon
+Documentation=https://github.com/
+After=network-online.target
+PartOf=plasma-workspace.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hisense-matterd --storage-directory %h/.local/share/hisenseac/chip-tool --node-id 1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=plasma-workspace.target
