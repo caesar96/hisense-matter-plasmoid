@@ -192,7 +192,7 @@ Properties:
 | `Mode`            | string | `off/fan/heat/cool/dry/auto`                       |
 | `Temperature`     | double | target setpoint, **°C** (always)                   |
 | `LocalTemperature`| double | room temperature, °C                               |
-| `FanSpeed`        | string | `auto/super_low/low/medium/high/super_high`        |
+| `FanSpeed`        | string | `auto/low/medium/high`                             |
 | `Swing`           | bool   | swing/oscillation on: `t_up_down`, or direction/angle on split units |
 | `Dimmer`          | bool   | display light on: `t_dimmer` (when reported)       |
 | `Eco`             | bool   | eco toggle                                         |
@@ -210,7 +210,7 @@ Refresh()                       re-read the device status now
 SetPower(bool on)               on -> last non-off mode (default cool)
 SetMode(string mode)            off|fan|heat|cool|dry|auto (off = power off)
 SetTemperature(double celsius)  setpoint; device display unit is preserved
-SetFanSpeed(string speed)       auto|super_low|low|medium|high|super_high
+SetFanSpeed(string speed)       auto|low|medium|high
 SetSwing(bool on)               portable units write t_up_down; split units t_swing_direction/angle
 SetDimmer(bool on)              display light (`t_dimmer`)
 SetEco(bool)  SetSuper(bool)  SetFanMute(bool)  SetSleep(bool)
@@ -222,7 +222,11 @@ reconcile with the device. A rejected write (the gateway returns a non-zero
 `errorCode`) surfaces through `LastError`.
 
 Mode codes are `0 fan, 1 heat, 2 cool, 3 dry, 4 auto`; fan codes are
-`0 auto, 5 super_low, 6 low, 7 medium, 8 high, 9 super_high`. Temperatures are
+`0 auto, 5 low, 7 medium, 9 high`. The four exposed speeds map onto the
+`5/7/9` ladder, which the portable units (type `006`/`008`) accept; the
+five-speed wall splits (type `009`) also accept these values, so no
+per-device table is needed (codes `6`/`8`, and `2`/`3`/`4` seen on some
+firmwares, are folded onto low/medium/high when read back). Temperatures are
 always exposed in Celsius; on write the daemon converts to the unit the device is
 currently configured for (`t_temp_type`: `0` = Celsius, `1` = Fahrenheit) so the
 panel's °F display is not clobbered.

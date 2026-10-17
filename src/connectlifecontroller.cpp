@@ -51,15 +51,17 @@ QString ConnectLifeController::codeToMode(int code)
 
 int ConnectLifeController::fanToCode(const QString &speed)
 {
-    if (speed == QLatin1String("super_low"))
+    // Devices differ in the numeric ladder they accept. The portable units
+    // (type 006/008) observed use the three-speed ladder 5/7/9; some other
+    // firmwares expose a five-speed 5..9 ladder. We expose four speeds
+    // (auto/low/medium/high) and always write the 5/7/9 values, which are
+    // valid across both ladders. "super_low"/"super_high" are kept as aliases
+    // so a stale widget cannot send an out-of-range code.
+    if (speed == QLatin1String("low") || speed == QLatin1String("super_low"))
         return 5;
-    if (speed == QLatin1String("low"))
-        return 6;
     if (speed == QLatin1String("medium"))
         return 7;
-    if (speed == QLatin1String("high"))
-        return 8;
-    if (speed == QLatin1String("super_high"))
+    if (speed == QLatin1String("high") || speed == QLatin1String("super_high"))
         return 9;
     return 0; // auto
 }
@@ -67,16 +69,17 @@ int ConnectLifeController::fanToCode(const QString &speed)
 QString ConnectLifeController::codeToFan(int code)
 {
     switch (code) {
+    case 2:
     case 5:
-        return QStringLiteral("super_low");
     case 6:
         return QStringLiteral("low");
+    case 3:
     case 7:
         return QStringLiteral("medium");
+    case 4:
     case 8:
-        return QStringLiteral("high");
     case 9:
-        return QStringLiteral("super_high");
+        return QStringLiteral("high");
     default:
         return QStringLiteral("auto");
     }

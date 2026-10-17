@@ -92,6 +92,9 @@ PlasmoidItem {
     readonly property bool tempAdjustable: mode !== "dry" && mode !== "fan"
     // Dry mode runs the fan at a fixed speed; fan speed is shown but locked.
     readonly property bool fanAdjustable: mode !== "dry"
+    // Sleep and "fast cooling" (super) do nothing in Fan and Dry modes, so the
+    // buttons are disabled there.
+    readonly property bool sleepSuperAllowed: mode !== "fan" && mode !== "dry"
     readonly property var activeProps: isCloud ? cloudProps : matterProps
     readonly property bool daemonAvailable: isCloud ? cloudAvailable : matterAvailable
     // Cloud needs no in-widget pairing (its credentials live in a config file),
@@ -104,14 +107,16 @@ PlasmoidItem {
 
     function fanLabel(s) {
         switch (s) {
-        case "super_low": return qsTr("Super low")
         case "low": return qsTr("Low")
         case "medium": return qsTr("Medium")
         case "high": return qsTr("High")
-        case "super_high": return qsTr("Super high")
         default: return qsTr("Auto")
         }
     }
+
+    // The ConnectLife app does not offer the "auto" fan speed in Fan mode, so
+    // the Auto entry is disabled there (it stays available in every other mode).
+    readonly property var fanMenuOptions: ["auto", "low", "medium", "high"]
 
     // coerces both the decoded value-type wrappers (returned by the initial
     // GetAll) and the raw values (from PropertiesChanged) to plain JS values.
@@ -218,9 +223,16 @@ PlasmoidItem {
     }
 
     // Force a fresh snapshot from the active daemon (used as a safety net).
+    // updateAll() re-reads the daemon's current D-Bus properties; the Refresh()
+    // call asks the daemon itself to re-poll the device (cloud/Matter).
     function refresh() {
         activeProps.updateAll()
+        _call("Refresh", [], "")
     }
+
+    // Opening the popup from the panel should immediately re-read the device
+    // instead of waiting for the next poll.
+    onExpandedChanged: if (expanded) refresh()
 
     // Fire-and-forget asynchronous D-Bus method call against the active daemon.
     // Method success is never taken as authoritative; the resulting state
@@ -504,12 +516,13 @@ PlasmoidItem {
             }
         }
         Repeater {
-            model: ["auto", "super_low", "low", "medium", "high", "super_high"]
+            model: root.fanMenuOptions
             PlasmaComponents.MenuItem {
                 property string value: modelData
                 text: root.fanLabel(modelData)
                 checkable: true
                 autoExclusive: true
+                enabled: !(value === "auto" && root.mode === "fan")
                 onTriggered: root.setFanSpeed(value)
             }
         }
@@ -1005,6 +1018,7 @@ PlasmoidItem {
                             accentColor: full.accent
                             emphasized: root.sleep
                             enabled: root.isCloud && root.connected && root.power
+                                     && root.sleepSuperAllowed
                             onClicked: root.toggleSleep()
                         }
                         PlasmaComponents.Label {
@@ -1025,6 +1039,7 @@ PlasmoidItem {
                             accentColor: full.accent
                             emphasized: root.superFast
                             enabled: root.isCloud && root.connected && root.power
+                                     && root.sleepSuperAllowed
                             onClicked: root.toggleSuper()
                         }
                         PlasmaComponents.Label {
