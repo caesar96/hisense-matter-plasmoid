@@ -7,7 +7,7 @@
                     |                                   |
                     |  org.kde.plasma.workspace.dbus     |
                     |  two DBus.Properties + two         |
-                    |  DBusServiceWatcher; auto-selects  |
+                    |  DBusServiceWatcher (controlled by settings) |
                     |  the active backend, reads GetAll /
                     |  PropertiesChanged and calls methods
                     +--------+-----------------+--------+
@@ -40,16 +40,18 @@
           v
 ```
 
-The plasmoid supports two backends and picks one at runtime:
+The plasmoid supports two backends (pinned in settings):
 
-- **`backend` = `auto`** (default) – use the ConnectLife cloud daemon if it is
-  registered on the bus, otherwise the Matter daemon.
-- **`matter`** – always use `hisense-matterd`.
-- **`cloud`** – always use `hisense-connectlife`.
+- **`backend` = `matter` or `cloud`** – talk to the selected daemon.
+- Settings: `matterEnabled`, `cloudEnabled` – selecting a backend sets its flag
+  and clears the other; the widget then calls systemd (user instance) to
+  `StopUnit`/`DisableUnitFiles` the other and `EnableUnitFiles`/`StartUnit` the
+  selected one. `SetUnitFileState` persistence (the enable symlink) makes the
+  choice survive reboots. The single "Run the selected daemon" switch just
+  turns the selected flag on/off.
 
-`DBusServiceWatcher.registered` on each service name drives the choice; when the
-active backend changes the widget calls `updateAll()` on the new
-`DBus.Properties` and repaints.
+When the selected backend changes or its flag flips, the policy is re-applied
+and `updateAll()` is called on the new `DBus.Properties`.
 
 ## D-Bus interface
 

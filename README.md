@@ -2,9 +2,10 @@
 
 Control a **Hisense air conditioner** from a KDE Plasma 6 desktop.
 
-Two interchangeable backends are provided; the plasmoid auto-selects whichever
-daemon is running (preferring the cloud one) and you can pin a specific one in
-its settings:
+Two interchangeable backends are provided; the plasmoid is pinned to the
+chosen backend in its settings. Only the selected daemon runs (the widget
+starts/enables the selected one and stops/disables the other in the user
+systemd instance):
 
 - **Matter (local, `hisense-matterd`)** – talks to the unit directly over your
   LAN via Matter. Fully offline, no account. Exposes only what the unit's Matter
@@ -147,9 +148,9 @@ are available through it.
    ```
 
 The daemon registers `org.kde.hisenseac.connectlife` / `/HisenseAC` /
-`org.kde.hisenseac.ConnectLife`. The plasmoid auto-selects it whenever it is on
-the bus (preferring it over Matter); you can pin a backend explicitly in the
-widget's settings (**Automatic / Matter / ConnectLife cloud**).
+`org.kde.hisenseac.ConnectLife`. In the widget settings, pick the
+backend (**Matter / ConnectLife cloud**) and use the switches to run only
+that daemon (the other will be stopped and disabled).
 
 The credentials are sent only to the ConnectLife/Higyu servers, exactly like the
 phone app. Requests are signed with the app's embedded RSA public key and the
@@ -186,10 +187,10 @@ hisense-ac provision "<ssid>" "<wifi-password>" "<pairing-code>"
 hisense-ac unpair              remove the pairing and forget local state
 ```
 
-Then add the **Hisense AC** widget to your panel or desktop. On a Matter-only
-setup it will pick that backend automatically; if the ConnectLife cloud daemon is
-also running it is preferred. Change this in the widget's settings if you want to
-force a specific backend.
+Then add the **Hisense AC** widget to your panel or desktop. Choose the
+backend in settings. Selecting a backend starts and enables its daemon
+and stops and disables the other (so the choice survives reboots). The
+"Run the selected daemon" switch turns the selected one on or off.
 
 On the Matter backend the widget distinguishes *commissioned* (paired — the
 pairing persists in the fabric store) from *reachable* (answering right now).

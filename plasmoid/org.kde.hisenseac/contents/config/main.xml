@@ -6,8 +6,16 @@
     <kcfgfile name=""/>
     <group name="General">
         <entry name="backend" type="String">
-            <label>Which daemon the widget should talk to</label>
-            <default>auto</default>
+            <label>Which daemon the widget should talk to (matter|cloud)</label>
+            <default>matter</default>
+        </entry>
+        <entry name="matterEnabled" type="Bool">
+            <label>Run Matter daemon (hisense-matterd)</label>
+            <default>true</default>
+        </entry>
+        <entry name="cloudEnabled" type="Bool">
+            <label>Run ConnectLife cloud daemon (hisense-connectlife)</label>
+            <default>true</default>
         </entry>
     </group>
 </kcfg>

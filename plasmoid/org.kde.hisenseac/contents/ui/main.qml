@@ -75,17 +75,18 @@ PlasmoidItem {
 
     readonly property string configuredBackend: {
         const b = plasmoid.configuration.backend
-        return (b === "matter" || b === "cloud") ? b : "auto"
+        return (b === "matter" || b === "cloud") ? b : "matter"
     }
     readonly property bool matterAvailable: matterWatcher.registered
     readonly property bool cloudAvailable: cloudWatcher.registered
-    // "auto" prefers the full-featured cloud daemon and falls back to Matter.
     readonly property string backendActive:
-        configuredBackend === "matter" ? "matter"
-        : configuredBackend === "cloud" ? "cloud"
-        : (cloudAvailable ? "cloud" : "matter")
+        configuredBackend === "cloud" ? "cloud" : "matter"
     readonly property bool isCloud: backendActive === "cloud"
     readonly property bool isMatter: !isCloud
+    // Whether the currently selected daemon should be kept running.
+    readonly property bool selectedDaemonEnabled: isCloud
+        ? Boolean(plasmoid.configuration.cloudEnabled)
+        : Boolean(plasmoid.configuration.matterEnabled)
     // Dry and fan modes have no temperature target, so the setpoint arc and the
     // +/- buttons are hidden there.
     readonly property bool tempAdjustable: mode !== "dry" && mode !== "fan"
@@ -235,7 +236,7 @@ PlasmoidItem {
         DBus.SessionBus.asyncCall({
             service: service,
             path: root.acPath,
-            interface: iface,
+            iface: iface,
             member: member,
             signature: fullSignature,
             arguments: args
@@ -385,10 +386,61 @@ PlasmoidItem {
         onRegisteredChanged: if (registered && root.isCloud) root.applyStatus()
     }
 
+    // ---- systemd daemon policy -------------------------------------------
+    // Only the selected daemon runs. Selecting a backend makes the widget
+    // start+enable that daemon and stop+disable the other, so the choice
+    // sticks across reboots. Toggling "Run daemon" off stops+disables it.
+    readonly property string matterUnit: "hisense-matterd.service"
+    readonly property string cloudUnit: "hisense-connectlife.service"
+    readonly property string sysdService: "org.freedesktop.systemd1"
+    readonly property string sysdPath: "/org/freedesktop/systemd1"
+    readonly property string sysdIface: "org.freedesktop.systemd1.Manager"
+
+    function sysdCall(member, args, signature) {
+        DBus.SessionBus.asyncCall({
+            service: root.sysdService,
+            path: root.sysdPath,
+            iface: root.sysdIface,
+            member: member,
+            signature: signature && signature.length > 0 ? "(" + signature + ")" : "",
+            arguments: args
+        }, function () {
+        }, function () {
+        })
+    }
+
+    // Bring one unit to the desired state (running+enabled, or stopped+disabled).
+    function setDaemon(unit, on) {
+        if (on) {
+            sysdCall("EnableUnitFiles", [[unit], false, true], "asbb")
+            sysdCall("StartUnit", [unit, "replace"], "ss")
+        } else {
+            sysdCall("StopUnit", [unit, "replace"], "ss")
+            sysdCall("DisableUnitFiles", [[unit], false], "asb")
+        }
+    }
+
+    function applyDaemonPolicy() {
+        const selected = root.isCloud ? root.cloudUnit : root.matterUnit
+        const other = root.isCloud ? root.matterUnit : root.cloudUnit
+        setDaemon(selected, root.selectedDaemonEnabled)
+        setDaemon(other, false)
+    }
     onBackendActiveChanged: Qt.callLater(function () { root.refresh() })
 
     // Pull an initial snapshot and re-pull whenever the active backend changes.
-    Component.onCompleted: root.refresh()
+    Component.onCompleted: {
+        root.refresh()
+        Qt.callLater(root.applyDaemonPolicy)
+    }
+    Connections {
+        target: plasmoid.configuration
+        function onValueChanged(key, value) {
+            if (key === "backend" || key === "matterEnabled" || key === "cloudEnabled") {
+                root.applyDaemonPolicy()
+            }
+        }
+    }
 
     // ---- mode menu --------------------------------------------------------
     PlasmaComponents.Menu {
@@ -563,8 +615,8 @@ PlasmoidItem {
             Layout.fillWidth: true
             visible: root.setupComplete && !root.daemonAvailable
             text: root.isCloud
-                ? qsTr("\u26A0 ConnectLife daemon not running \u2014 start hisense-connectlife.")
-                : qsTr("\u26A0 Control service not running \u2014 showing the last known state.")
+                ? qsTr("\u26A0 ConnectLife daemon not running (hisense-connectlife) \u2014 enable it in settings or start it.")
+                : qsTr("\u26A0 Matter daemon not running (hisense-matterd) \u2014 enable it in settings or start it.")
             color: "#e0a251"
             wrapMode: Text.WordWrap
             font.pointSize: 8
@@ -710,12 +762,16 @@ PlasmoidItem {
                 }
 
                 Item {
+                    // This area is always reserved so the widget keeps the same
+                    // height in every mode. In dry and fan-only modes (which have
+                    // no temperature target) a mode icon/description replaces the
+                    // setpoint arc instead of leaving a gap.
                     Layout.fillWidth: true
                     Layout.preferredHeight: 190
-                    visible: root.tempAdjustable
 
                     TempArc {
                         id: arc
+                        visible: root.tempAdjustable
                         anchors.horizontalCenter: parent.horizontalCenter
                         width: height
                         height: parent.height
@@ -734,6 +790,7 @@ PlasmoidItem {
 
                     ColumnLayout {
                         anchors.centerIn: parent
+                        visible: root.tempAdjustable
                         spacing: 0
                         PlasmaComponents.Label {
                             Layout.alignment: Qt.AlignHCenter
@@ -757,6 +814,7 @@ PlasmoidItem {
                     }
 
                     CircleButton {
+                        visible: root.tempAdjustable
                         anchors.left: parent.left
                         anchors.verticalCenter: parent.verticalCenter
                         iconName: "list-remove"
@@ -766,6 +824,7 @@ PlasmoidItem {
                         onClicked: root.setSetpoint(root.setpoint - 1)
                     }
                     CircleButton {
+                        visible: root.tempAdjustable
                         anchors.right: parent.right
                         anchors.verticalCenter: parent.verticalCenter
                         iconName: "list-add"
@@ -773,6 +832,38 @@ PlasmoidItem {
                         accentColor: full.accent
                         enabled: root.connected && root.power
                         onClicked: root.setSetpoint(root.setpoint + 1)
+                    }
+
+                    // Placeholder shown instead of the arc in dry / fan-only mode.
+                    ColumnLayout {
+                        anchors.centerIn: parent
+                        visible: !root.tempAdjustable
+                        width: parent.width
+                        spacing: Kirigami.Units.smallSpacing
+                        Kirigami.Icon {
+                            Layout.alignment: Qt.AlignHCenter
+                            source: root.mode === "fan" ? "fan-symbolic" : "raindrop"
+                            implicitWidth: Kirigami.Units.iconSizes.huge
+                            implicitHeight: Kirigami.Units.iconSizes.huge
+                            opacity: 0.55
+                        }
+                        PlasmaComponents.Label {
+                            Layout.fillWidth: true
+                            text: root.mode === "fan" ? qsTr("Fan only") : qsTr("Dry")
+                            horizontalAlignment: Text.AlignHCenter
+                            font.bold: true
+                            font.pointSize: 13
+                        }
+                        PlasmaComponents.Label {
+                            Layout.fillWidth: true
+                            text: root.mode === "fan"
+                                ? qsTr("No temperature control")
+                                : qsTr("Dehumidifying at a fixed fan speed")
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.WordWrap
+                            opacity: 0.6
+                            font.pointSize: 8
+                        }
                     }
                 }
 
