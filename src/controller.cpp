@@ -276,6 +276,27 @@ void Controller::writeMode(int systemMode)
                                   m_connected = true;
                                   setError(QString());
                                   emit stateChanged();
+                                  if (systemMode != 0) {
+                                      // On power-on the unit restores its own
+                                      // remembered setpoint instead of the one
+                                      // exposed here, so re-assert the value the
+                                      // user sees once the unit is up. Capture it
+                                      // now, before the refresh can overwrite it.
+                                      const double desired = (systemMode == 4)
+                                          ? m_heatingSetpoint : m_coolingSetpoint;
+                                      if (desired > 0.0) {
+                                          QTimer::singleShot(600, this,
+                                              [this, systemMode, desired]() {
+                                                  if (m_systemMode != systemMode)
+                                                      return;
+                                                  if (systemMode == 4)
+                                                      writeHeating(desired);
+                                                  else
+                                                      writeCooling(desired);
+                                              });
+                                          return;
+                                      }
+                                  }
                               } else {
                                   setError(value);
                                   m_connected = false;

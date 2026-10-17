@@ -6,7 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Core Network DBus)
+find_package(OpenSSL REQUIRED)
 
 add_subdirectory(src)
 
-install(TARGETS hisense-matterd hisense-ac RUNTIME DESTINATION bin)
+install(TARGETS hisense-matterd hisense-ac hisense-connectlife RUNTIME DESTINATION bin)

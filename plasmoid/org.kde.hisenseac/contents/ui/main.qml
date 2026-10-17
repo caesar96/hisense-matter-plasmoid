@@ -1,11 +1,9 @@
-// SPDX-License-Identifier: MIT
 import QtQuick
 import QtQuick.Layouts
-import QtQuick.Controls as QQC
 
 import org.kde.plasma.plasmoid
 import org.kde.plasma.components as PlasmaComponents
-import org.kde.plasma.plasma5support as Plasma5Support
+import org.kde.plasma.workspace.dbus as DBus
 
 import org.kde.kirigami as Kirigami
 
@@ -35,6 +33,19 @@ PlasmoidItem {
     // and keep polling briskly until the daemon reports the outcome.
     property bool pairingRequested: false
 
+    // ---- ConnectLife cloud extras (only meaningful for the cloud backend) --
+    property string deviceId: ""
+    property string fanSpeed: "auto"
+    property bool superFast: false
+    property bool sleep: false
+    property bool fanMute: false
+    property bool swing: false
+    property bool dimmer: false
+    property real humidity: 0
+    // While a cloud write is in flight, keep showing the optimistic value and
+    // do not let a slightly stale poll snapshot overwrite it.
+    property bool extrasLock: false
+
     // Optimistic UI: a command updates the display immediately and is rolled
     // back if the device rejects it (or never confirms).
     property bool pending: false
@@ -45,29 +56,87 @@ PlasmoidItem {
     property bool _devPower: false
     property string _devMode: "off"
     property real _devSetpoint: 25
+    property string _devFanSpeed: "auto"
+    property bool _devSuper: false
+    property bool _devSleep: false
+    property bool _devFanMute: false
+    property bool _devSwing: false
+    property bool _devDimmer: false
+    // Last non-off mode, so a power-on can show the resumed mode at once
+    // instead of waiting for the next poll to confirm it.
+    property string _lastMode: "cool"
+
+    // ---- backend selection ------------------------------------------------
+    readonly property string matterService: "org.kde.hisenseac"
+    readonly property string cloudService: "org.kde.hisenseac.connectlife"
+    readonly property string acPath: "/HisenseAC"
+    readonly property string matterIface: "org.kde.hisenseac.Control"
+    readonly property string cloudIface: "org.kde.hisenseac.ConnectLife"
+
+    readonly property string configuredBackend: {
+        const b = plasmoid.configuration.backend
+        return (b === "matter" || b === "cloud") ? b : "auto"
+    }
+    readonly property bool matterAvailable: matterWatcher.registered
+    readonly property bool cloudAvailable: cloudWatcher.registered
+    // "auto" prefers the full-featured cloud daemon and falls back to Matter.
+    readonly property string backendActive:
+        configuredBackend === "matter" ? "matter"
+        : configuredBackend === "cloud" ? "cloud"
+        : (cloudAvailable ? "cloud" : "matter")
+    readonly property bool isCloud: backendActive === "cloud"
+    readonly property bool isMatter: !isCloud
+    // Dry and fan modes have no temperature target, so the setpoint arc and the
+    // +/- buttons are hidden there.
+    readonly property bool tempAdjustable: mode !== "dry" && mode !== "fan"
+    // Dry mode runs the fan at a fixed speed; fan speed is shown but locked.
+    readonly property bool fanAdjustable: mode !== "dry"
+    readonly property var activeProps: isCloud ? cloudProps : matterProps
+    readonly property bool daemonAvailable: isCloud ? cloudAvailable : matterAvailable
+    // Cloud needs no in-widget pairing (its credentials live in a config file),
+    // so its main card is always available.
+    readonly property bool setupComplete: isCloud ? true : commissioned
 
     function cap(s) {
         return s.length ? s.charAt(0).toUpperCase() + s.slice(1) : s
     }
 
-    readonly property string acCommand: Plasmoid.configuration.command
-    // plasmashell's PATH usually lacks ~/.local/bin, but the executable engine
-    // runs commands through a shell, so we can prepend it inline.
-    readonly property string shellPrefix: "PATH=\"$HOME/.local/bin:$PATH\" "
-    readonly property string statusCommand: shellPrefix + acCommand + " status --json"
+    function fanLabel(s) {
+        switch (s) {
+        case "super_low": return qsTr("Super low")
+        case "low": return qsTr("Low")
+        case "medium": return qsTr("Medium")
+        case "high": return qsTr("High")
+        case "super_high": return qsTr("Super high")
+        default: return qsTr("Auto")
+        }
+    }
 
-    function applyStatus(text) {
-        try {
-            const s = JSON.parse(text)
-            connected = s.connected
-            commissioned = s.commissioned === true
-            localTemp = s.localTemperature
-            minSetpoint = s.minSetpoint
-            maxSetpoint = s.maxSetpoint
-            lastError = s.lastError
-            provisioning = s.provisioning === true
-            unpairing = s.unpairing === true
-            provisionError = s.provisionError || ""
+    // coerces both the decoded value-type wrappers (returned by the initial
+    // GetAll) and the raw values (from PropertiesChanged) to plain JS values.
+    function _num(v, fallback) {
+        const n = Number(v)
+        return isNaN(n) ? fallback : n
+    }
+
+    // Applies the active daemon's exported state.
+    function applyStatus() {
+        const p = activeProps.properties
+        // An unset key means we have not received a snapshot yet.
+        if (p === undefined)
+            return
+
+        if (isMatter) {
+            if (p.Connected === undefined)
+                return
+            connected = Boolean(p.Connected)
+            commissioned = Boolean(p.Commissioned)
+            minSetpoint = _num(p.MinSetpoint, 16)
+            maxSetpoint = _num(p.MaxSetpoint, 32)
+            lastError = p.LastError === undefined ? "" : String(p.LastError)
+            provisioning = Boolean(p.Provisioning)
+            unpairing = Boolean(p.Unpairing)
+            provisionError = p.ProvisionError === undefined ? "" : String(p.ProvisionError)
 
             // Once the daemon has finished (commissioned the AC or reported an
             // error) drop the optimistic "pairing" state.
@@ -78,46 +147,105 @@ PlasmoidItem {
             }
 
             if (forgetting) {
-                if (unpairing)
+                if (unpairing) {
                     _sawUnpairing = true
-                else if (_sawUnpairing || !commissioned) {
-                    // Unpair finished (either way) or the fabric is gone.
+                } else if (_sawUnpairing || !commissioned
+                           || provisionError.length > 0) {
                     forgetting = false
                     _sawUnpairing = false
                     forgetTimer.stop()
                 }
             }
 
-            _devPower = s.power
-            _devMode = s.mode
-            _devSetpoint = s.coolingSetpoint
+            _devPower = Boolean(p.Power)
+            _devMode = p.Mode === undefined ? "off" : String(p.Mode)
+            _devSetpoint = _num(p.CoolingSetpoint, 0)
+            localTemp = _num(p.LocalTemperature, 0)
+        } else {
+            if (p.Connected === undefined && p.Power === undefined)
+                return
+            connected = Boolean(p.Connected)
+            commissioned = true
+            minSetpoint = 16
+            maxSetpoint = 32
+            lastError = p.LastError === undefined ? "" : String(p.LastError)
+            deviceId = p.DeviceId === undefined ? "" : String(p.DeviceId)
 
-            if (pending) {
-                if (lastError.length > 0) {
-                    rollback()
-                } else if (s.power === power && s.mode === mode
-                           && Math.abs(s.coolingSetpoint - setpoint) < 0.5) {
-                    // Device confirmed the change.
-                    pending = false
-                    pendingTimer.stop()
-                    power = s.power
-                    mode = s.mode
-                    setpoint = s.coolingSetpoint
-                }
-                // Otherwise keep showing the optimistic value.
-            } else {
-                power = s.power
-                mode = s.mode
-                setpoint = s.coolingSetpoint
+            _devPower = Boolean(p.Power)
+            _devMode = p.Mode === undefined ? "off" : String(p.Mode)
+            _devSetpoint = _num(p.Temperature, 0)
+            localTemp = _num(p.LocalTemperature, 0)
+            _devFanSpeed = p.FanSpeed === undefined ? "auto" : String(p.FanSpeed)
+            _devSuper = Boolean(p.Super)
+            _devSleep = Boolean(p.Sleep)
+            _devFanMute = Boolean(p.FanMute)
+            _devSwing = Boolean(p.Swing)
+            _devDimmer = Boolean(p.Dimmer)
+            humidity = _num(p.Humidity, 0)
+        }
+
+        if (_devMode !== "off")
+            _lastMode = _devMode
+
+        if (pending) {
+            if (lastError.length > 0) {
+                rollback()
+            } else if (_devPower === power && _devMode === mode
+                       && Math.abs(_devSetpoint - setpoint) < 0.5) {
+                // Device confirmed the change.
+                pending = false
+                pendingTimer.stop()
+                power = _devPower
+                mode = _devMode
+                setpoint = _devSetpoint
             }
-        } catch (e) {
-            // ignore malformed output (daemon may be starting up)
+            // Otherwise keep showing the optimistic value.
+        } else {
+            power = _devPower
+            mode = _devMode
+            setpoint = _devSetpoint
+        }
+
+        if (isCloud && !extrasLock) {
+            fanSpeed = _devFanSpeed
+            superFast = _devSuper
+            sleep = _devSleep
+            fanMute = _devFanMute
+            swing = _devSwing
+            dimmer = _devDimmer
         }
     }
 
+    // Force a fresh snapshot from the active daemon (used as a safety net).
     function refresh() {
-        statusSource.disconnectSource(statusCommand)
-        statusSource.connectSource(statusCommand)
+        activeProps.updateAll()
+    }
+
+    // Fire-and-forget asynchronous D-Bus method call against the active daemon.
+    // Method success is never taken as authoritative; the resulting state
+    // arrives via PropertiesChanged.
+    function _call(member, args, signature, onError) {
+        const service = isCloud ? cloudService : matterService
+        const iface = isCloud ? cloudIface : matterIface
+        // A D-Bus message signature is a type list, e.g. "(d)" or "(uu)" -- the
+        // surrounding parentheses are required. The DBusMessage map constructor
+        // also expects the key "interface" (the QML property is exposed as
+        // "iface", but the map is read by name on the C++ side).
+        const fullSignature = signature && signature.length > 0 ? "(" + signature + ")" : ""
+        DBus.SessionBus.asyncCall({
+            service: service,
+            path: root.acPath,
+            interface: iface,
+            member: member,
+            signature: fullSignature,
+            arguments: args
+        }, function () {
+        }, function (reply) {
+            const message = (reply && reply.error && reply.error.message)
+                ? reply.error.message : ""
+            if (onError)
+                onError(message)
+        })
     }
 
     function _beginPending() {
@@ -144,50 +272,76 @@ PlasmoidItem {
             return
         _beginPending()
         setpoint = v
-        send("setpoint " + v)
+        const member = isCloud ? "SetTemperature" : "SetSetpoint"
+        _call(member, [v], "d", function (m) { root.lastError = m; root.rollback() })
     }
 
-    function setMode(key) {
-        if (mode === key)
+    function setMode(m) {
+        if (m === mode)
             return
         _beginPending()
-        mode = key
-        if (key !== "off")
-            power = true
-        send("mode " + key)
+        mode = m
+        power = true
+        _call("SetMode", [m], "s", function (msg) { root.lastError = msg; root.rollback() })
     }
 
     function setPower(on) {
-        if (power === on)
+        if (on === power)
             return
         _beginPending()
         power = on
-        send(on ? "on" : "off")
+        // Resuming from off: show the mode the unit will come back up in
+        // immediately, instead of waiting for the next poll to confirm it.
+        if (on && _lastMode !== "off")
+            mode = _lastMode
+        _call("SetPower", [on], "b", function (m) { root.lastError = m; root.rollback() })
     }
 
-    // Single-quote a value for the shell the executable engine runs commands in.
-    function _shq(s) {
-        return "'" + String(s).replace(/'/g, "'\\''") + "'"
+    // ---- cloud-only controls ---------------------------------------------
+    function _pushExtra(member, args, signature) {
+        if (!isCloud)
+            return
+        extrasLock = true
+        extrasTimer.restart()
+        _call(member, args, signature, function (m) { root.lastError = m })
+    }
+
+    function setFanSpeed(s) {
+        if (!isCloud || s === fanSpeed)
+            return
+        fanSpeed = s
+        _pushExtra("SetFanSpeed", [s], "s")
+    }
+
+    function toggleSleep() {
+        sleep = !sleep
+        _pushExtra("SetSleep", [sleep], "b")
+    }
+
+    function toggleSuper() {
+        superFast = !superFast
+        _pushExtra("SetSuper", [superFast], "b")
+    }
+
+    function toggleSwing() {
+        swing = !swing
+        _pushExtra("SetSwing", [swing], "b")
+    }
+
+    function toggleDimmer() {
+        dimmer = !dimmer
+        _pushExtra("SetDimmer", [dimmer], "b")
     }
 
     function provision(ssid, password, code) {
-        if (ssid.length === 0 || password.length === 0 || code.length === 0) {
-            provError = qsTr("Enter the Wi-Fi name, password and pairing code.")
-            return
-        }
         provError = ""
         pairingRequested = true
         pairStallTimer.restart()
-        cmdSource.run(root.shellPrefix + root.acCommand + " provision "
-                      + _shq(ssid) + " " + _shq(password) + " " + _shq(code), ok => {
-            if (!ok) {
-                provError = qsTr("Could not reach the daemon (is hisense-matterd running?)")
-                pairingRequested = false
-                pairStallTimer.stop()
-            }
+        _call("Provision", [ssid, password, code], "sss", function () {
+            provError = qsTr("Could not reach the daemon (is hisense-matterd running?)")
+            pairingRequested = false
+            pairStallTimer.stop()
         })
-        refreshTimer.remaining = 10
-        refreshTimer.restart()
     }
 
     function forget() {
@@ -196,66 +350,64 @@ PlasmoidItem {
         forgetting = true
         _sawUnpairing = false
         forgetTimer.restart()
-        cmdSource.run(root.shellPrefix + root.acCommand + " unpair", ok => {
-            if (!ok) {
-                provError = qsTr("Could not reach the daemon (is hisense-matterd running?)")
-                forgetting = false
-                forgetTimer.stop()
-            }
+        _call("Unpair", [], "", function () {
+            provError = qsTr("Could not reach the daemon (is hisense-matterd running?)")
+            forgetting = false
+            forgetTimer.stop()
         })
-        refreshTimer.remaining = 10
-        refreshTimer.restart()
     }
 
-    Plasma5Support.DataSource {
-        id: statusSource
-        engine: "executable"
-        connectedSources: [root.statusCommand]
-        onNewData: (source, data) => {
-            if (data["exit code"] === 0 && data.stdout)
-                root.applyStatus(data.stdout)
-        }
+    // ---- daemon bindings --------------------------------------------------
+    // Event-driven status: each daemon publishes PropertiesChanged whenever its
+    // state changes. Only the active one's snapshot is read by applyStatus().
+    DBus.Properties {
+        id: matterProps
+        service: root.matterService
+        path: root.acPath
+        iface: root.matterIface
+        onPropertiesChanged: root.applyStatus()
+    }
+    DBus.Properties {
+        id: cloudProps
+        service: root.cloudService
+        path: root.acPath
+        iface: root.cloudIface
+        onPropertiesChanged: root.applyStatus()
+    }
+    DBus.DBusServiceWatcher {
+        id: matterWatcher
+        watchedService: root.matterService
+        onRegisteredChanged: if (registered && root.isMatter) root.applyStatus()
+    }
+    DBus.DBusServiceWatcher {
+        id: cloudWatcher
+        watchedService: root.cloudService
+        onRegisteredChanged: if (registered && root.isCloud) root.applyStatus()
     }
 
-    // Always poll the daemon so the UI tracks it even when no command was
-    // issued (the DataSource itself only runs once per connect).
-    Timer {
-        id: pollTimer
-        interval: 10000
-        repeat: true
-        running: true
-        triggeredOnStart: true
-        onTriggered: root.refresh()
-    }
+    onBackendActiveChanged: Qt.callLater(function () { root.refresh() })
 
-    // One-shot command runner: connect, collect, disconnect.
-    Plasma5Support.DataSource {
-        id: cmdSource
-        engine: "executable"
-        connectedSources: []
-        property var onDone: null
-        onNewData: (source, data) => {
-            const ok = data["exit code"] === 0
-            const done = onDone
-            onDone = null
-            disconnectSource(source)
-            if (done)
-                done(ok)
-        }
-        function run(cmd, done) { onDone = done; connectSource(cmd) }
-    }
+    // Pull an initial snapshot and re-pull whenever the active backend changes.
+    Component.onCompleted: root.refresh()
 
-    // Mode selector popup. autoExclusive renders radio (single-choice) markers.
-    // Only Cool and Heat are honoured by this unit's firmware (thermostat
-    // FeatureMap = 3); Auto/Fan/Dry are accepted over Matter but ignored by the
-    // hardware, so they are intentionally not offered.
+    // ---- mode menu --------------------------------------------------------
     PlasmaComponents.Menu {
         id: modeMenu
-        // autoExclusive rewrites `checked` on click, so re-assert on each open.
         onVisibleChanged: if (visible) syncChecks()
         function syncChecks() {
+            autoItem.checked = root.mode === "auto"
             coolItem.checked = root.mode === "cool"
+            dryItem.checked = root.mode === "dry"
+            fanItem.checked = root.mode === "fan"
             heatItem.checked = root.mode === "heat"
+        }
+        PlasmaComponents.MenuItem {
+            id: autoItem
+            visible: root.isCloud
+            text: qsTr("Auto")
+            checkable: true
+            autoExclusive: true
+            onTriggered: root.setMode("auto")
         }
         PlasmaComponents.MenuItem {
             id: coolItem
@@ -263,6 +415,22 @@ PlasmoidItem {
             checkable: true
             autoExclusive: true
             onTriggered: root.setMode("cool")
+        }
+        PlasmaComponents.MenuItem {
+            id: dryItem
+            visible: root.isCloud
+            text: qsTr("Dry")
+            checkable: true
+            autoExclusive: true
+            onTriggered: root.setMode("dry")
+        }
+        PlasmaComponents.MenuItem {
+            id: fanItem
+            visible: root.isCloud
+            text: qsTr("Fan only")
+            checkable: true
+            autoExclusive: true
+            onTriggered: root.setMode("fan")
         }
         PlasmaComponents.MenuItem {
             id: heatItem
@@ -273,29 +441,35 @@ PlasmoidItem {
         }
     }
 
-    // Poll the daemon briskly after a command so the optimistic value is
-    // confirmed (or rolled back) quickly.
-    Timer {
-        id: refreshTimer
-        interval: 800
-        repeat: true
-        property int remaining: 0
-        onTriggered: {
-            root.refresh()
-            if (--remaining <= 0)
-                stop()
+    // ---- fan speed menu (cloud only) -------------------------------------
+    PlasmaComponents.Menu {
+        id: fanMenu
+        onVisibleChanged: if (visible) syncChecks()
+        function syncChecks() {
+            for (let i = 0; i < count; ++i) {
+                const it = itemAt(i)
+                it.checked = (it.value === root.fanSpeed)
+            }
+        }
+        Repeater {
+            model: ["auto", "super_low", "low", "medium", "high", "super_high"]
+            PlasmaComponents.MenuItem {
+                property string value: modelData
+                text: root.fanLabel(modelData)
+                checkable: true
+                autoExclusive: true
+                onTriggered: root.setFanSpeed(value)
+            }
         }
     }
 
-    // Lapse the "really forget?" confirmation state after a few seconds.
+    // ---- timers -----------------------------------------------------------
     Timer {
         id: confirmTimer
         interval: 4000
         repeat: false
         onTriggered: root.confirmForget = false
     }
-
-    // Safety net so the button never stays stuck on "Forgetting…".
     Timer {
         id: forgetTimer
         interval: 30000
@@ -306,9 +480,6 @@ PlasmoidItem {
             root.refresh()
         }
     }
-
-    // If the device never confirms the optimistic change, settle on whatever
-    // the device actually reports (a rollback).
     Timer {
         id: pendingTimer
         interval: 9000
@@ -320,27 +491,15 @@ PlasmoidItem {
             root.setpoint = root._devSetpoint
         }
     }
-
-    function send(cmd) {
-        cmdSource.run(root.shellPrefix + root.acCommand + " " + cmd, ok => {
-            if (!ok)
-                root.rollback()
-        })
-        refreshTimer.remaining = 10
-        refreshTimer.restart()
-    }
-
-    // Keep polling while the daemon reports a pairing in progress (it can take
-    // a minute or two).
     Timer {
-        id: provisionPoller
-        interval: 1000
-        repeat: true
-        running: root.provisioning || root.pairingRequested
-        onTriggered: root.refresh()
+        id: extrasTimer
+        interval: 8000
+        repeat: false
+        onTriggered: {
+            root.extrasLock = false
+            root.refresh()
+        }
     }
-
-    // Safety net so the Pair button never stays stuck on "Pairing…".
     Timer {
         id: pairStallTimer
         interval: 180000
@@ -351,7 +510,7 @@ PlasmoidItem {
         }
     }
 
-    // ---- representations ----
+    // ---- representations --------------------------------------------------
     compactRepresentation: Item {
         id: compact
         readonly property int hPadding: Kirigami.Units.smallSpacing * 3
@@ -365,11 +524,11 @@ PlasmoidItem {
             anchors.centerIn: parent
             spacing: Kirigami.Units.smallSpacing
             PlasmaComponents.Label {
-                text: root.commissioned ? root.localTemp.toFixed(0) + "\u00B0" : "\u2014"
+                text: root.setupComplete ? root.localTemp.toFixed(0) + "\u00B0" : "\u2014"
                 font.bold: true
             }
             PlasmaComponents.Label {
-                text: !root.commissioned ? qsTr("Not set up")
+                text: !root.setupComplete ? qsTr("Not set up")
                     : (!root.connected ? qsTr("Offline")
                                        : (root.power ? root.cap(root.mode) : qsTr("Off")))
                 opacity: 0.8
@@ -384,10 +543,8 @@ PlasmoidItem {
     fullRepresentation: ColumnLayout {
         id: full
         spacing: Kirigami.Units.largeSpacing
-        // Keep enough room that the arc and the -/+ buttons never overlap.
         Layout.minimumWidth: 340
         Layout.preferredWidth: 360
-        // Size to content so there is no dead space under the quick actions.
         Layout.minimumHeight: 480
         Layout.preferredHeight: implicitHeight
 
@@ -401,19 +558,30 @@ PlasmoidItem {
                                                   Kirigami.Theme.textColor.b,
                                                   dark ? 0.16 : 0.09)
 
-        // ---- offline hint (paired, but the AC is not answering) --------
+        // ---- offline hints ---------------------------------------------
         PlasmaComponents.Label {
             Layout.fillWidth: true
-            visible: root.commissioned && !root.connected && root.provisionError.length === 0
+            visible: root.setupComplete && !root.daemonAvailable
+            text: root.isCloud
+                ? qsTr("\u26A0 ConnectLife daemon not running \u2014 start hisense-connectlife.")
+                : qsTr("\u26A0 Control service not running \u2014 showing the last known state.")
+            color: "#e0a251"
+            wrapMode: Text.WordWrap
+            font.pointSize: 8
+        }
+        PlasmaComponents.Label {
+            Layout.fillWidth: true
+            visible: root.setupComplete && root.daemonAvailable && !root.connected
+                     && root.provisionError.length === 0
             text: qsTr("\u26A0 Air conditioner offline \u2014 showing its last known state. Check power and Wi-Fi.")
             color: "#e0a251"
             wrapMode: Text.WordWrap
             font.pointSize: 8
         }
 
-        // ---- setup (shown until the AC has been commissioned) ----------
+        // ---- setup (Matter only, until commissioned) -------------------
         Rectangle {
-            visible: !root.commissioned
+            visible: root.isMatter && !root.commissioned
             Layout.fillWidth: true
             Layout.preferredHeight: setupCol.implicitHeight + Kirigami.Units.largeSpacing * 2
             radius: Kirigami.Units.largeSpacing
@@ -506,7 +674,7 @@ PlasmoidItem {
 
         // ---- main card -------------------------------------------------
         Rectangle {
-            visible: root.commissioned
+            visible: root.setupComplete
             Layout.fillWidth: true
             Layout.preferredHeight: mainCol.implicitHeight + Kirigami.Units.largeSpacing * 2
             radius: Kirigami.Units.largeSpacing
@@ -520,7 +688,6 @@ PlasmoidItem {
                 anchors.margins: Kirigami.Units.largeSpacing
                 spacing: Kirigami.Units.largeSpacing
 
-                // header: indoor temperature + power
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: Kirigami.Units.smallSpacing
@@ -542,10 +709,10 @@ PlasmoidItem {
                     }
                 }
 
-                // temperature arc + fine buttons + readout
                 Item {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 190
+                    visible: root.tempAdjustable
 
                     TempArc {
                         id: arc
@@ -654,15 +821,15 @@ PlasmoidItem {
                         }
                     }
 
-                    // Speed is not exposed over Matter on this unit.
                     Rectangle {
+                        id: speedBox
                         Layout.fillWidth: true
                         implicitHeight: modeRow.implicitHeight + Kirigami.Units.smallSpacing * 2
                         radius: Kirigami.Units.smallSpacing
                         color: "transparent"
                         border.width: 1
                         border.color: full.hairline
-                        opacity: 0.55
+                        opacity: (root.isCloud && root.fanAdjustable) ? 1 : 0.55
                         RowLayout {
                             anchors.fill: parent
                             anchors.leftMargin: Kirigami.Units.smallSpacing * 1.5
@@ -675,9 +842,22 @@ PlasmoidItem {
                             }
                             Item { Layout.fillWidth: true }
                             PlasmaComponents.Label {
-                                text: qsTr("N/A")
+                                text: root.isCloud ? root.fanLabel(root.fanSpeed) : qsTr("N/A")
                                 font.bold: true
                             }
+                            Kirigami.Icon {
+                                visible: root.isCloud
+                                source: "arrow-down"
+                                implicitWidth: Kirigami.Units.iconSizes.small
+                                implicitHeight: Kirigami.Units.iconSizes.small
+                                opacity: 0.6
+                            }
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            enabled: root.isCloud && root.connected && root.fanAdjustable
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: fanMenu.popup(speedBox, 0, speedBox.height)
                         }
                     }
                 }
@@ -686,7 +866,7 @@ PlasmoidItem {
 
         // ---- quick actions ----
         Rectangle {
-            visible: root.commissioned
+            visible: root.setupComplete
             Layout.fillWidth: true
             Layout.preferredHeight: quickCol.implicitHeight + Kirigami.Units.largeSpacing * 2
             radius: Kirigami.Units.largeSpacing
@@ -703,57 +883,114 @@ PlasmoidItem {
                 RowLayout {
                     Layout.alignment: Qt.AlignHCenter
                     spacing: Kirigami.Units.largeSpacing
-                    Repeater {
-                        model: [
-                            { icon: "media-playlist-repeat", label: qsTr("Swing") },
-                            { icon: "weather-clear-night", label: qsTr("Sleep") },
-                            { icon: "weather-snow", label: qsTr("Fast Cooling") },
-                            { icon: "brightness-high", label: qsTr("Dimmer") }
-                        ]
-                        delegate: ColumnLayout {
-                            Layout.preferredWidth: Kirigami.Units.gridUnit * 3.4
-                            spacing: Kirigami.Units.smallSpacing
-                            CircleButton {
-                                Layout.alignment: Qt.AlignHCenter
-                                iconName: modelData.icon
-                                diameter: Kirigami.Units.gridUnit * 2.4
-                                enabled: false
-                            }
-                            PlasmaComponents.Label {
-                                Layout.fillWidth: true
-                                text: modelData.label
-                                font.pointSize: 8
-                                opacity: 0.6
-                                wrapMode: Text.WordWrap
-                                horizontalAlignment: Text.AlignHCenter
-                            }
+
+                    ColumnLayout {
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 3.4
+                        spacing: Kirigami.Units.smallSpacing
+                        CircleButton {
+                            Layout.alignment: Qt.AlignHCenter
+                            iconName: "media-playlist-repeat"
+                            diameter: Kirigami.Units.gridUnit * 2.4
+                            accentColor: full.accent
+                            emphasized: root.swing
+                            enabled: root.isCloud && root.connected && root.power
+                            onClicked: root.toggleSwing()
+                        }
+                        PlasmaComponents.Label {
+                            Layout.fillWidth: true
+                            text: qsTr("Swing")
+                            horizontalAlignment: Text.AlignHCenter
+                            opacity: root.isCloud ? 0.8 : 0.4
                         }
                     }
+
+                    ColumnLayout {
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 3.4
+                        spacing: Kirigami.Units.smallSpacing
+                        CircleButton {
+                            Layout.alignment: Qt.AlignHCenter
+                            iconName: "weather-clear-night"
+                            diameter: Kirigami.Units.gridUnit * 2.4
+                            accentColor: full.accent
+                            emphasized: root.sleep
+                            enabled: root.isCloud && root.connected && root.power
+                            onClicked: root.toggleSleep()
+                        }
+                        PlasmaComponents.Label {
+                            Layout.fillWidth: true
+                            text: qsTr("Sleep")
+                            horizontalAlignment: Text.AlignHCenter
+                            opacity: root.isCloud ? 0.8 : 0.4
+                        }
+                    }
+
+                    ColumnLayout {
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 3.4
+                        spacing: Kirigami.Units.smallSpacing
+                        CircleButton {
+                            Layout.alignment: Qt.AlignHCenter
+                            iconName: "weather-snow"
+                            diameter: Kirigami.Units.gridUnit * 2.4
+                            accentColor: full.accent
+                            emphasized: root.superFast
+                            enabled: root.isCloud && root.connected && root.power
+                            onClicked: root.toggleSuper()
+                        }
+                        PlasmaComponents.Label {
+                            Layout.fillWidth: true
+                            text: qsTr("Fast cooling")
+                            horizontalAlignment: Text.AlignHCenter
+                            opacity: root.isCloud ? 0.8 : 0.4
+                        }
+                    }
+
+                    ColumnLayout {
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 3.4
+                        spacing: Kirigami.Units.smallSpacing
+                        CircleButton {
+                            Layout.alignment: Qt.AlignHCenter
+                            iconName: "games-hint"
+                            diameter: Kirigami.Units.gridUnit * 2.4
+                            accentColor: full.accent
+                            emphasized: root.dimmer
+                            enabled: root.isCloud && root.connected && root.power
+                            onClicked: root.toggleDimmer()
+                        }
+                        PlasmaComponents.Label {
+                            Layout.fillWidth: true
+                            text: qsTr("Display")
+                            horizontalAlignment: Text.AlignHCenter
+                            opacity: root.isCloud ? 0.8 : 0.4
+                        }
+                    }
+
                 }
 
                 PlasmaComponents.Label {
                     Layout.fillWidth: true
-                    text: qsTr("Not exposed over Matter on this unit")
+                    visible: !root.isCloud
+                    text: qsTr("These controls need the ConnectLife cloud daemon.")
+                    horizontalAlignment: Text.AlignHCenter
                     opacity: 0.5
                     font.pointSize: 8
-                    horizontalAlignment: Text.AlignHCenter
                 }
             }
         }
 
         PlasmaComponents.Label {
-            visible: text.length > 0
-            text: (root.connected && root.lastError.length > 0)
-                ? root.lastError
-                : (root.commissioned ? root.provisionError : "")
-            color: "#e05151"
-            wrapMode: Text.Wrap
             Layout.fillWidth: true
+            visible: text.length > 0
+            text: root.connected ? root.lastError
+                : (root.provisionError.length > 0 ? root.provisionError : root.lastError)
+            color: "#e05151"
+            wrapMode: Text.WordWrap
+            font.pointSize: 8
         }
 
+        // ---- forget action (Matter pairing only) ----
         RowLayout {
             Layout.fillWidth: true
-            visible: root.connected
+            visible: root.connected && root.isMatter
             spacing: Kirigami.Units.smallSpacing
             PlasmaComponents.BusyIndicator {
                 Layout.preferredWidth: Kirigami.Units.iconSizes.small
@@ -784,5 +1021,5 @@ PlasmoidItem {
     toolTipMainText: "Hisense AC"
     toolTipSubText: root.connected
         ? (root.localTemp.toFixed(1) + " \u00B0C, " + (root.power ? root.cap(root.mode) : "Off"))
-        : (root.commissioned ? qsTr("Offline") : qsTr("Not paired"))
+        : (root.setupComplete ? qsTr("Offline") : qsTr("Not paired"))
 }

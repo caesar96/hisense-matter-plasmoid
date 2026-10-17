@@ -1,0 +1,14 @@
+[Unit]
+Description=Hisense ConnectLife cloud air conditioner daemon
+Documentation=https://github.com/
+After=network-online.target
+PartOf=plasma-workspace.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hisense-connectlife --config %h/.config/hisenseac/connectlife.conf
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=plasma-workspace.target

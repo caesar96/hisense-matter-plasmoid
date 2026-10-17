@@ -1,0 +1,15 @@
+# Credentials for the ConnectLife cloud daemon (hisense-connectlife).
+#
+# Copy this file to ~/.config/hisenseac/connectlife.conf and make it private:
+#     install -Dm600 connectlife.conf.example ~/.config/hisenseac/connectlife.conf
+#
+# These are the same e-mail and password you use in the ConnectLife phone app.
+# They are sent only to the ConnectLife/Higyu servers, exactly like the app.
+
+[connectlife]
+login=you@example.com
+password=
+
+# Optional. Pin a specific unit by its puid. Leave empty to use the only
+# air conditioner found in the account.
+deviceId=

@@ -10,10 +10,13 @@
 #include <QCoreApplication>
 #include <QDBusConnection>
 #include <QDBusError>
+#include <QDBusMessage>
 #include <QDebug>
 #include <QDir>
+#include <QMetaProperty>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QVariantMap>
 
 namespace {
 constexpr const char *kServiceName = "org.kde.hisenseac";
@@ -95,6 +98,34 @@ int main(int argc, char *argv[])
                     << bus.lastError().message();
         return 5;
     }
+
+    // QtDBus exports the org.freedesktop.DBus.Properties interface but never
+    // emits PropertiesChanged for a plain (non-adaptor) QObject. Publish it
+    // ourselves whenever the controller signals a state change so generic
+    // clients (e.g. the QML org.kde.plasma.workspace.dbus "Properties" type)
+    // can update without polling.
+    QObject::connect(&controller, &Controller::stateChanged, &app, [&bus, &controller]() {
+        QVariantMap changed;
+        const QMetaObject *meta = controller.metaObject();
+        const QByteArray notify = QByteArrayLiteral("stateChanged");
+        for (int i = 0; i < meta->propertyCount(); ++i) {
+            const QMetaProperty property = meta->property(i);
+            if (property.hasNotifySignal()
+                && property.notifySignal().name() == notify) {
+                changed.insert(QString::fromUtf8(property.name()),
+                               property.read(&controller));
+            }
+        }
+        if (changed.isEmpty())
+            return;
+        QDBusMessage signal = QDBusMessage::createSignal(
+            QLatin1String(kObjectPath),
+            QStringLiteral("org.freedesktop.DBus.Properties"),
+            QStringLiteral("PropertiesChanged"));
+        signal << QStringLiteral("org.kde.hisenseac.Control") << changed
+               << QStringList();
+        bus.send(signal);
+    });
 
     QTimer refreshTimer;
     refreshTimer.setInterval(kRefreshIntervalMs);

@@ -27,13 +27,16 @@ for arg in "$@"; do
     esac
 done
 
-echo ">> stopping daemon"
+echo ">> stopping daemons"
 systemctl --user disable --now hisense-matterd.service >/dev/null 2>&1 || true
+systemctl --user disable --now hisense-connectlife.service >/dev/null 2>&1 || true
 systemctl --user reset-failed hisense-matterd.service >/dev/null 2>&1 || true
+systemctl --user reset-failed hisense-connectlife.service >/dev/null 2>&1 || true
 
-echo ">> removing systemd user unit"
+echo ">> removing systemd user units"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 rm -f "$UNIT_DIR/hisense-matterd.service"
+rm -f "$UNIT_DIR/hisense-connectlife.service"
 systemctl --user daemon-reload || true
 
 echo ">> removing plasmoid"
@@ -45,11 +48,14 @@ if [[ -f "$ROOT/build/install_manifest.txt" ]]; then
         [[ -f "$path" ]] && rm -f "$path"
     done < "$ROOT/build/install_manifest.txt"
 else
-    rm -f "$PREFIX/bin/hisense-matterd" "$PREFIX/bin/hisense-ac"
+    rm -f "$PREFIX/bin/hisense-matterd" "$PREFIX/bin/hisense-ac" \
+          "$PREFIX/bin/hisense-connectlife"
 fi
 
-echo ">> removing packaged service copy"
-rm -f "$PREFIX/share/hisenseac/hisense-matterd.service"
+echo ">> removing packaged service copies"
+rm -f "$PREFIX/share/hisenseac/hisense-matterd.service" \
+      "$PREFIX/share/hisenseac/hisense-connectlife.service" \
+      "$PREFIX/share/hisenseac/connectlife.conf.example"
 rmdir "$PREFIX/share/hisenseac" 2>/dev/null || true
 
 if [[ "$PURGE" == "1" ]]; then

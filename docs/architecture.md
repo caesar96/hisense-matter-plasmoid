@@ -1,39 +1,55 @@
 # Architecture
 
 ```
-+---------------------------+
-|  Plasma plasmoid (QML)    |   org.kde.hisenseac
-|  org.kde.hisenseac        |
-|                           |
-|  Plasma5Support           |   runs on a timer (onNewData)
-│  executable datasource ───┼──> hisense-ac status --json
-|                           |
-|  command runner           |
-│  (connectSource)          |──► hisense-ac mode cool / setpoint 25 / on|off
-+-------------+-------------+
-              | one-shot subprocess
-              v
-        +-----------+      D-Bus (session bus)
-        | hisense-ac |  <---------------------------+
-        +-----------+                               |
-                                                     |
-        org.kde.hisenseac /HisenseAC                 |
-        org.kde.hisenseac.Control                    |
-                                                     v
-                                          +---------------------+
-                                          |  hisense-matterd    |
-                                          |  Controller (QObject)|
-                                          +----------+----------+
-                                                     | ChipCli
-                                                     v
-                                          +---------------------+
-                                          | chip-tool interactive|  (one warm
-                                          |   start             |   process)
-                                          +----------+----------+
-                                                     | CASE over IPv6/UDP
-                                                     v
-                                              Hisense AC (Matter)
+                    +-----------------------------------+
+                    |        Plasma plasmoid (QML)      |
+                    |        org.kde.hisenseac          |
+                    |                                   |
+                    |  org.kde.plasma.workspace.dbus     |
+                    |  two DBus.Properties + two         |
+                    |  DBusServiceWatcher; auto-selects  |
+                    |  the active backend, reads GetAll /
+                    |  PropertiesChanged and calls methods
+                    +--------+-----------------+--------+
+                             |                 |
+               D-Bus session bus               |
+                             |                 |
+       +---------------------+                 +-----------------------+
+       |                                                                 |
+       v org.kde.hisenseac.connectlife          org.kde.hisenseac       v
+       | /HisenseAC                              /HisenseAC
+       | org.kde.hisenseac.ConnectLife           org.kde.hisenseac.Control
+       |                                                                 |
++-----------------------+                                  +------------------------+
+| hisense-connectlife   |                                  | hisense-matterd        |
+| ConnectLifeController |                                  | Controller (QObject)   |
++----------+------------+                                  +-----------+------------+
+           | ConnectLifeApi                                            | ChipCli
+           v                                                           v
+  ConnectLife / Higyu cloud                             +---------------------------+
+  (signed REST over HTTPS)                             | chip-tool interactive     |
+                                                       | (one warm process)        |
+                                                       +------------+-------------+
+                                                                    | CASE over IPv6/UDP
+                                                                    v
+                                                            Hisense AC (Matter)
+
+   +-------------+
+   |  hisense-ac |  thin CLI client for the Matter daemon
+   +------+------+  (D-Bus org.kde.hisenseac.Control, session bus)
+          v
 ```
+
+The plasmoid supports two backends and picks one at runtime:
+
+- **`backend` = `auto`** (default) – use the ConnectLife cloud daemon if it is
+  registered on the bus, otherwise the Matter daemon.
+- **`matter`** – always use `hisense-matterd`.
+- **`cloud`** – always use `hisense-connectlife`.
+
+`DBusServiceWatcher.registered` on each service name drives the choice; when the
+active backend changes the widget calls `updateAll()` on the new
+`DBus.Properties` and repaints.
 
 ## D-Bus interface
 
@@ -95,8 +111,10 @@ than the pairing form.
 
 `hisense-matterd` registers the `Controller` QObject directly with
 `QDBusConnection::registerObject(..., ExportAllSlots | ExportAllProperties |
-ExportAllSignals)`. Qt automatically implements `Properties.Get/Set/GetAll` and
-emits `PropertiesChanged` when the shared `stateChanged()` NOTIFY signal fires.
+ExportAllSignals)`. Qt implements `org.freedesktop.DBus.Properties.Get/Set/GetAll`
+and `Introspectable`. The daemon also emits
+`org.freedesktop.DBus.Properties.PropertiesChanged` whenever `stateChanged()` fires
+so QML clients (via `org.kde.plasma.workspace.dbus.Properties`) update event-driven.
 
 ## Matter ⇄ friendly mapping
 
@@ -155,7 +173,86 @@ required, or chip-tool silently creates a second fabric that the AC rejects:
 > `--storage-directory ~/.local/share/hisenseac/chip-tool`, or the daemon can no
 > longer see the commissioned device.
 
-## Limitations carried over from the device
+## ConnectLife cloud backend
+
+`hisense-connectlife` registers `org.kde.hisenseac.connectlife`, object
+`/HisenseAC`, interface `org.kde.hisenseac.ConnectLife`, exporting the
+`ConnectLifeController` QObject the same way (`ExportAllSlots |
+ExportAllProperties | ExportAllSignals` + a manual `PropertiesChanged` on
+`stateChanged`).
+
+Properties:
+
+| Property          | Type   | Meaning                                            |
+|-------------------|--------|----------------------------------------------------|
+| `Connected`       | bool   | the cloud reports the device online                |
+| `Power`           | bool   | `t_power == 1`                                     |
+| `Mode`            | string | `off/fan/heat/cool/dry/auto`                       |
+| `Temperature`     | double | target setpoint, **°C** (always)                   |
+| `LocalTemperature`| double | room temperature, °C                               |
+| `FanSpeed`        | string | `auto/super_low/low/medium/high/super_high`        |
+| `Swing`           | bool   | swing/oscillation on: `t_up_down`, or direction/angle on split units |
+| `Dimmer`          | bool   | display light on: `t_dimmer` (when reported)       |
+| `Eco`             | bool   | eco toggle                                         |
+| `Super`           | bool   | "super"/turbo toggle                               |
+| `FanMute`         | bool   | fan-mute (quiet) toggle                            |
+| `Sleep`           | bool   | sleep toggle                                       |
+| `Humidity`        | double | room humidity, % (when reported)                   |
+| `LastError`       | string | last error, empty when healthy                     |
+| `DeviceId`        | string | puid of the controlled unit (constant)             |
+
+Methods:
+
+```
+Refresh()                       re-read the device status now
+SetPower(bool on)               on -> last non-off mode (default cool)
+SetMode(string mode)            off|fan|heat|cool|dry|auto (off = power off)
+SetTemperature(double celsius)  setpoint; device display unit is preserved
+SetFanSpeed(string speed)       auto|super_low|low|medium|high|super_high
+SetSwing(bool on)               portable units write t_up_down; split units t_swing_direction/angle
+SetDimmer(bool on)              display light (`t_dimmer`)
+SetEco(bool)  SetSuper(bool)  SetFanMute(bool)  SetSleep(bool)
+```
+
+Writes are optimistic: the controller updates its cached state immediately,
+broadcasts `stateChanged`, and schedules a re-read (`Refresh`) ~2.5 s later to
+reconcile with the device. A rejected write (the gateway returns a non-zero
+`errorCode`) surfaces through `LastError`.
+
+Mode codes are `0 fan, 1 heat, 2 cool, 3 dry, 4 auto`; fan codes are
+`0 auto, 5 super_low, 6 low, 7 medium, 8 high, 9 super_high`. Temperatures are
+always exposed in Celsius; on write the daemon converts to the unit the device is
+currently configured for (`t_temp_type`: `0` = Celsius, `1` = Fahrenheit) so the
+panel's °F display is not clobbered.
+
+### Talking to the cloud
+
+`ConnectLifeApi` reproduces the official app's request pipeline:
+
+1. **Auth** – `accounts.login` on Gigya EU (login + password + app key) →
+   `accounts.getJWT` → `oauth/authorize` → `oauth/token`, yielding a bearer
+   access token. The token is cached under
+   `~/.cache/hisenseac/connectlife-token.json` (mode `600`, ~12 h) so restarts do
+   not re-login; Gigya rate-limits repeated logins per IP.
+2. **Read** – signed `GET /clife-svc/pu/get_device_status_list`; the daemon picks
+   the unit matching the configured puid (or the only AC).
+3. **Write** – signed `POST /device/pu/property/set` with `t_power`,
+   `t_work_mode`, `t_temp`, `t_fan_speed`, etc.
+
+Every request carries a set of common fields (`appId`, `appSecret`, `languageId`,
+`randStr`, `timeStamp`, `timezone`, `version`) plus a signature: the fields are
+`sorted → k=v&... → + salt → sha256 → RSA-encrypt (PKCS#1 v1.5) with the app's
+public key → base64`. The public key is embedded in `src/connectlifeapi.cpp`
+(verbatim copy of the vendor `pubkey.pem`). The signature contains base64 `+`,
+so the request body is hand-built percent-encoded — `QUrlQuery` would leave `+`
+literal and the gateway would form-decode it to a space, breaking the signature
+(`101001 Signature check fail`). The write reply is checked on `errorCode` (not
+`code`).
+
+The daemon polls on a timer (default 30 s, `--interval`) and otherwise only polls
+on demand after a write; there is no push/subscription.
+
+## Limitations (Matter backend) carried over from the device
 
 The AC only implements the Thermostat cluster (plus Identify/Groups/Descriptor and
 ThermostatUserInterfaceConfiguration). Its Thermostat cluster has just the 19
@@ -173,3 +270,9 @@ actuator. Only `Cool` (3) and `Heat` (4) change the hardware, so the plasmoid
 offers just those.
 
 Attestation verification is bypassed (no PAA/CD trust store installed).
+
+None of these Matter limitations apply to the **ConnectLife cloud backend**,
+which drives the vendor API and therefore reaches every mode and feature the
+phone app can (fan speed, swing, dry, eco, ...). It trades the fully-local Matter
+path for a dependence on the vendor cloud and the operator's ConnectLife
+account.

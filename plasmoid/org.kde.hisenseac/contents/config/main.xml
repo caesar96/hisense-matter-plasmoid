@@ -5,9 +5,9 @@
                           http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
     <kcfgfile name=""/>
     <group name="General">
-        <entry name="command" type="String">
-            <label>Command used to talk to hisense-matterd</label>
-            <default>hisense-ac</default>
+        <entry name="backend" type="String">
+            <label>Which daemon the widget should talk to</label>
+            <default>auto</default>
         </entry>
     </group>
 </kcfg>
