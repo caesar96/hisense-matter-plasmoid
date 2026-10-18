@@ -92,9 +92,12 @@ PlasmoidItem {
     readonly property bool tempAdjustable: mode !== "dry" && mode !== "fan"
     // Dry mode runs the fan at a fixed speed; fan speed is shown but locked.
     readonly property bool fanAdjustable: mode !== "dry"
-    // Sleep and "fast cooling" (super) do nothing in Fan and Dry modes, so the
-    // buttons are disabled there.
+    // Sleep and the "fast" boost (super) do nothing in Fan and Dry modes, so
+    // the buttons are disabled there.
     readonly property bool sleepSuperAllowed: mode !== "fan" && mode !== "dry"
+    // The single "super" boost reads as "Fast cooling" in Cool/Auto mode and
+    // "Fast heating" in Heat mode; only the label and icon differ.
+    readonly property bool superHeating: mode === "heat"
     readonly property var activeProps: isCloud ? cloudProps : matterProps
     readonly property bool daemonAvailable: isCloud ? cloudAvailable : matterAvailable
     // Cloud needs no in-widget pairing (its credentials live in a config file),
@@ -614,7 +617,7 @@ PlasmoidItem {
         Layout.preferredHeight: implicitHeight
 
         readonly property bool dark: Kirigami.Theme.backgroundColor.hslLightness < 0.5
-        readonly property color accent: "#2f7de1"
+        readonly property color accent: root.mode === "heat" ? "#ef8b2c" : "#2f7de1"
         readonly property color cardColor: dark
             ? Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.05)
             : Qt.rgba(1, 1, 1, 1)
@@ -795,7 +798,8 @@ PlasmoidItem {
                         activeColor: full.accent
                         inactiveColor: full.dark
                             ? Qt.rgba(full.accent.r, full.accent.g, full.accent.b, 0.22)
-                            : "#d5e2f7"
+                            : (root.mode === "heat" ? "#f7ddc9" : "#d5e2f7")
+                        thumbBorderColor: full.accent
                         enabled: root.connected && root.power
                         opacity: enabled ? 1 : 0.5
                         onMoved: (value) => root.setSetpoint(value)
@@ -855,7 +859,8 @@ PlasmoidItem {
                         spacing: Kirigami.Units.smallSpacing
                         Kirigami.Icon {
                             Layout.alignment: Qt.AlignHCenter
-                            source: root.mode === "fan" ? "fan-symbolic" : "raindrop"
+                            source: root.mode === "fan" ? Qt.resolvedUrl("../images/fan-symbolic.svg") : "raindrop"
+                            isMask: root.mode === "fan"
                             implicitWidth: Kirigami.Units.iconSizes.huge
                             implicitHeight: Kirigami.Units.iconSizes.huge
                             opacity: 0.55
@@ -1013,7 +1018,7 @@ PlasmoidItem {
                         spacing: Kirigami.Units.smallSpacing
                         CircleButton {
                             Layout.alignment: Qt.AlignHCenter
-                            iconName: "weather-clear-night"
+                            iconName: "weather-clear-night-symbolic"
                             diameter: Kirigami.Units.gridUnit * 2.4
                             accentColor: full.accent
                             emphasized: root.sleep
@@ -1034,7 +1039,7 @@ PlasmoidItem {
                         spacing: Kirigami.Units.smallSpacing
                         CircleButton {
                             Layout.alignment: Qt.AlignHCenter
-                            iconName: "weather-snow"
+                            iconName: "weather-snow-symbolic"
                             diameter: Kirigami.Units.gridUnit * 2.4
                             accentColor: full.accent
                             emphasized: root.superFast
@@ -1044,7 +1049,7 @@ PlasmoidItem {
                         }
                         PlasmaComponents.Label {
                             Layout.fillWidth: true
-                            text: qsTr("Fast cooling")
+                            text: root.superHeating ? qsTr("Fast heating") : qsTr("Fast cooling")
                             horizontalAlignment: Text.AlignHCenter
                             opacity: root.isCloud ? 0.8 : 0.4
                         }
