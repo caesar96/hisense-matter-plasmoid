@@ -42,6 +42,12 @@ PlasmoidItem {
     property bool swing: false
     property bool dimmer: false
     property real humidity: 0
+    // While the daemon is signing in again after a manual "Refresh login".
+    property bool refreshingLogin: false
+    // The re-login action only appears when the daemon reports an error (and
+    // while an attempt is in flight), so the normal popup stays clean.
+    readonly property bool showRefreshLogin: isCloud
+        && (lastError.length > 0 || refreshingLogin)
     // While a cloud write is in flight, keep showing the optimistic value and
     // do not let a slightly stale poll snapshot overwrite it.
     property bool extrasLock: false
@@ -179,6 +185,7 @@ PlasmoidItem {
             maxSetpoint = 32
             lastError = p.LastError === undefined ? "" : String(p.LastError)
             deviceId = p.DeviceId === undefined ? "" : String(p.DeviceId)
+            refreshingLogin = Boolean(p.RefreshingLogin)
 
             _devPower = Boolean(p.Power)
             _devMode = p.Mode === undefined ? "off" : String(p.Mode)
@@ -320,6 +327,20 @@ PlasmoidItem {
         extrasLock = true
         extrasTimer.restart()
         _call(member, args, signature, function (m) { root.lastError = m })
+    }
+
+    // The gateway can start rejecting the cached token with a rate-limit
+    // error even though it has not expired. Signing in again fetches a fresh
+    // token; the daemon clears its backoff so the attempt is not swallowed.
+    function refreshLogin() {
+        if (refreshingLogin)
+            return
+        refreshingLogin = true
+        lastError = ""
+        _call("RefreshLogin", [], "", function (m) {
+            refreshingLogin = false
+            lastError = m
+        })
     }
 
     function setFanSpeed(s) {
@@ -1096,6 +1117,30 @@ PlasmoidItem {
             color: "#e05151"
             wrapMode: Text.WordWrap
             font.pointSize: 8
+        }
+
+        // ---- cloud re-login ----
+        // Only shown while the cloud backend reports an error: the cached
+        // ConnectLife token can start being rejected with a rate-limit error,
+        // and a fresh login recovers immediately.
+        RowLayout {
+            Layout.fillWidth: true
+            visible: root.showRefreshLogin
+            spacing: Kirigami.Units.smallSpacing
+            PlasmaComponents.BusyIndicator {
+                Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                running: root.refreshingLogin
+                visible: running
+            }
+            PlasmaComponents.Button {
+                Layout.fillWidth: true
+                flat: true
+                icon.name: "view-refresh"
+                text: root.refreshingLogin ? qsTr("Logging in\u2026") : qsTr("Refresh login")
+                enabled: !root.refreshingLogin && root.lastError.length > 0
+                onClicked: root.refreshLogin()
+            }
         }
 
         // ---- forget action (Matter pairing only) ----

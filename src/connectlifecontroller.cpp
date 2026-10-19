@@ -13,6 +13,12 @@ ConnectLifeController::ConnectLifeController(ConnectLifeApi *api, QObject *paren
     : QObject(parent)
     , m_api(api)
 {
+    // Debounce outgoing writes: rapid changes (temperature arc drags, repeated
+    // button taps) are merged into a single property set. Keeps us under the
+    // gateway's rate limit and is friendlier to the device too.
+    m_writeTimer.setSingleShot(true);
+    m_writeTimer.setInterval(800);
+    connect(&m_writeTimer, &QTimer::timeout, this, &ConnectLifeController::flushWrite);
 }
 
 QString ConnectLifeController::deviceId() const
@@ -161,9 +167,41 @@ void ConnectLifeController::Refresh()
         });
 }
 
+void ConnectLifeController::RefreshLogin()
+{
+    if (m_refreshingLogin)
+        return;
+
+    m_refreshingLogin = true;
+    m_lastError.clear();
+    emit stateChanged();
+
+    m_api->refreshToken([this](bool ok, const QString &, const QString &error) {
+        m_refreshingLogin = false;
+        if (!ok) {
+            m_lastError = error;
+            emit stateChanged();
+            return;
+        }
+        emit stateChanged();
+        Refresh();
+    });
+}
+
 void ConnectLifeController::write(const QVariantMap &properties)
 {
-    m_api->setProperties(properties, [this](bool ok, const QString &error) {
+    for (auto it = properties.constBegin(); it != properties.constEnd(); ++it)
+        m_pendingWrite.insert(it.key(), it.value());
+    m_writeTimer.start();
+}
+
+void ConnectLifeController::flushWrite()
+{
+    if (m_pendingWrite.isEmpty())
+        return;
+    QVariantMap props;
+    props.swap(m_pendingWrite);
+    m_api->setProperties(props, [this](bool ok, const QString &error) {
         if (!ok)
             setError(error);
         scheduleRefresh();

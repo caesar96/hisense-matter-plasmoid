@@ -154,8 +154,14 @@ that daemon (the other will be stopped and disabled).
 
 The credentials are sent only to the ConnectLife/Higyu servers, exactly like the
 phone app. Requests are signed with the app's embedded RSA public key and the
-resulting access token is cached (mode `600`) for ~12 h so restarts do not
-re-login (Gigya rate-limits repeated logins).
+resulting access token is cached (mode `600`) until shortly before it expires
+(~12 h) so restarts do not re-login (Gigya rate-limits repeated logins).
+
+The cached token can also go stale before its expiry and then make the gateway
+answer any request with "Api rate limit exceeded". A fresh login is the way out,
+so whenever the daemon reports an error the widget shows a **Refresh login**
+button (cloud backend only): it drops the cached token, clears the daemon's
+rate-limit backoff and signs in again.
 
 CLI options:
 
@@ -249,8 +255,12 @@ feature the app can.
 - Requires your ConnectLife account credentials and an internet connection.
 - Uses a **reverse-engineered, unofficial API**; Hisense can change or break it
   at any time. Login failures are rate-limited per IP.
-- Polls every 30 s (configurable with `--interval`); state changes made outside
-  the daemon appear at most one poll later.
+- Polls every 5 min (configurable with `--interval`); state changes made outside
+  the daemon appear at most one poll later. The gateway rate-limits aggressive
+  clients ("Api rate limit exceeded"), so reads are coalesced, writes are
+  debounced/merged and a rate-limited reply triggers an automatic exponential
+  backoff instead of more requests. If the error persists with a cached token,
+  use the widget's **Refresh login** button to force a fresh login.
 
 ## Repository layout
 

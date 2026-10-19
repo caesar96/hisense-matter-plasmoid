@@ -25,7 +25,10 @@ namespace {
 constexpr const char *kServiceName = "org.kde.hisenseac.connectlife";
 constexpr const char *kObjectPath = "/HisenseAC";
 constexpr const char *kInterface = "org.kde.hisenseac.ConnectLife";
-constexpr int kRefreshIntervalMs = 30000;
+// The ConnectLife gateway rate-limits aggressive clients ("Api rate limit
+// exceeded"); the phone app only reads on demand, so 5 min is a polite default
+// that still keeps the widget fresh. Tune with --interval.
+constexpr int kRefreshIntervalMs = 5 * 60 * 1000;
 
 QString defaultConfigPath()
 {

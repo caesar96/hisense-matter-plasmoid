@@ -201,12 +201,14 @@ Properties:
 | `Sleep`           | bool   | sleep toggle                                       |
 | `Humidity`        | double | room humidity, % (when reported)                   |
 | `LastError`       | string | last error, empty when healthy                     |
+| `RefreshingLogin` | bool   | a forced re-login is in progress                   |
 | `DeviceId`        | string | puid of the controlled unit (constant)             |
 
 Methods:
 
 ```
 Refresh()                       re-read the device status now
+RefreshLogin()                  drop the cached access token and log in again
 SetPower(bool on)               on -> last non-off mode (default cool)
 SetMode(string mode)            off|fan|heat|cool|dry|auto (off = power off)
 SetTemperature(double celsius)  setpoint; device display unit is preserved
@@ -238,8 +240,10 @@ panel's °F display is not clobbered.
 1. **Auth** – `accounts.login` on Gigya EU (login + password + app key) →
    `accounts.getJWT` → `oauth/authorize` → `oauth/token`, yielding a bearer
    access token. The token is cached under
-   `~/.cache/hisenseac/connectlife-token.json` (mode `600`, ~12 h) so restarts do
-   not re-login; Gigya rate-limits repeated logins per IP.
+   `~/.cache/hisenseac/connectlife-token.json` (mode `600`, lifetime from the
+   token endpoint, ~12 h fallback) so restarts do not re-login; Gigya
+   rate-limits repeated logins per IP, so logins are single-flight: concurrent
+   requests share the one login chain already in progress.
 2. **Read** – signed `GET /clife-svc/pu/get_device_status_list`; the daemon picks
    the unit matching the configured puid (or the only AC).
 3. **Write** – signed `POST /device/pu/property/set` with `t_power`,
@@ -255,8 +259,23 @@ literal and the gateway would form-decode it to a space, breaking the signature
 (`101001 Signature check fail`). The write reply is checked on `errorCode` (not
 `code`).
 
-The daemon polls on a timer (default 30 s, `--interval`) and otherwise only polls
-on demand after a write; there is no push/subscription.
+The daemon polls on a timer (default 300 s, `--interval`) and otherwise only polls
+on demand after a write; there is no push/subscription. The gateway throttles
+aggressive clients ("Api rate limit exceeded"), so the daemon defends itself:
+status reads are single-flight (overlapping refreshes share one request), writes
+are debounced and merged (800 ms, so a temperature-arc drag becomes a single
+property set instead of one request per step), and a rate-limited reply (HTTP 429
+or a rate-limit message in the body, from either the gateway or Gigya) puts the
+API into an exponential backoff (60 s doubling per hit, capped at 30 min) during
+which requests fail fast through `LastError` instead of being sent.
+
+A cached token that the gateway no longer accepts produces that same
+"Api rate limit exceeded" reply. `RefreshLogin()` (the widget's **Refresh login**
+button) is the escape hatch: it drops the in-memory and on-disk token, resets
+the backoff so the attempt is not swallowed, and runs the login chain again
+(single-flight, so a concurrent request joins it instead of starting a second
+Gigya login). The controller exposes `RefreshingLogin` while it runs and
+re-reads the status once the login succeeds.
 
 ## Limitations (Matter backend) carried over from the device
 

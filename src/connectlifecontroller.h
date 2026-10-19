@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <QJsonObject>
 #include <QObject>
 #include <QString>
+#include <QTimer>
+#include <QVariantMap>
 
 #include <functional>
 
@@ -35,6 +38,7 @@ class ConnectLifeController : public QObject
     Q_PROPERTY(bool Sleep READ sleep NOTIFY stateChanged)
     Q_PROPERTY(double Humidity READ humidity NOTIFY stateChanged)
     Q_PROPERTY(QString LastError READ lastError NOTIFY stateChanged)
+    Q_PROPERTY(bool RefreshingLogin READ refreshingLogin NOTIFY stateChanged)
     Q_PROPERTY(QString DeviceId READ deviceId CONSTANT)
 
 public:
@@ -54,10 +58,16 @@ public:
     bool sleep() const { return m_sleep; }
     double humidity() const { return m_humidity; }
     QString lastError() const { return m_lastError; }
+    bool refreshingLogin() const { return m_refreshingLogin; }
     QString deviceId() const;
 
 public slots:
     void Refresh();
+    // Drops the cached access token and signs in again. The gateway can start
+    // answering any request with a rate-limit error for a token it no longer
+    // accepts; a fresh login is the way out, so the widget exposes this as a
+    // manual action.
+    void RefreshLogin();
     void SetPower(bool on);
     void SetMode(const QString &mode);
     void SetTemperature(double celsius);
@@ -75,6 +85,9 @@ signals:
 private:
     void applyStatus(const QJsonObject &device);
     void write(const QVariantMap &properties);
+    // Sends everything accumulated by write() (debounced so a slider drag
+    // becomes one request instead of one per step).
+    void flushWrite();
     void scheduleRefresh(int ms = 2500);
     void setError(const QString &error);
 
@@ -106,5 +119,12 @@ private:
     bool m_sleep = false;
     double m_humidity = 0.0;
     QString m_lastError;
+    bool m_refreshingLogin = false;
     QString m_unit = QStringLiteral("0"); // device display unit, 0 = celsius
+
+    // Debounced, merged outgoing writes. Dragging the temperature arc fires a
+    // change per step; sending each one immediately produced a request burst
+    // that the cloud gateway rate-limits.
+    QTimer m_writeTimer;
+    QVariantMap m_pendingWrite;
 };

@@ -46,6 +46,19 @@ constexpr const char *kAppSecret =
 constexpr const char *kSignSalt = "D9519A4B756946F081B7BB5B5E8D1197";
 constexpr const char *kUserAgent = "Runner/2.0.6 (iPhone; iOS 17.2.1; Scale/3.00)";
 
+// The gateway throttles aggressive clients ("Api rate limit exceeded"). After
+// a rate-limited reply we fail fast for a while instead of sending requests:
+// 60 s, doubling per consecutive hit, capped at 30 min. A clean reply resets
+// the backoff.
+constexpr int kBackoffBaseSec = 60;
+constexpr int kBackoffMaxSec = 30 * 60;
+
+// Assumed token lifetime when the token endpoint does not say otherwise.
+constexpr int kDefaultTokenLifetimeSec = 12 * 3600;
+// Re-login shortly before the token actually dies so no request is sent with
+// an expired token.
+constexpr int kTokenSafetyMarginSec = 120;
+
 constexpr const char *kPublicKeyPem =
     "-----BEGIN PUBLIC KEY-----\n"
     "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyyWrNG6q475HIHu7sMVu\n"
@@ -107,6 +120,11 @@ void ConnectLifeApi::saveTokenCache() const
         file.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
         file.write(QJsonDocument(json).toJson(QJsonDocument::Compact));
     }
+}
+
+void ConnectLifeApi::clearTokenCache() const
+{
+    QFile::remove(tokenCachePath());
 }
 
 void ConnectLifeApi::setDeviceId(const QString &puid)
@@ -197,6 +215,61 @@ QByteArray ConnectLifeApi::sign(const QVariantMap &data) const
     return out.toBase64();
 }
 
+bool ConnectLifeApi::looksRateLimited(int httpStatus, const QByteArray &body)
+{
+    if (httpStatus == 429)
+        return true;
+    // The gateway and Gigya both report throttling inside an HTTP 200 body
+    // (e.g. "Api rate limit exceeded", "Exceeded API call rate limit").
+    const QByteArray lower = body.toLower();
+    return lower.contains("rate limit") || lower.contains("too many requests");
+}
+
+void ConnectLifeApi::noteRequestOutcome(const QString &what, int httpStatus,
+                                        const QByteArray &body)
+{
+    if (!looksRateLimited(httpStatus, body)) {
+        m_rateLimitHits = 0;
+        m_backoffUntilMs = 0;
+        return;
+    }
+    ++m_rateLimitHits;
+    const int shift = qMin(m_rateLimitHits - 1, 6);
+    const int seconds = qMin(kBackoffBaseSec << shift, kBackoffMaxSec);
+    m_backoffUntilMs = QDateTime::currentMSecsSinceEpoch() + qint64(seconds) * 1000;
+
+    // Surface what the server actually said: the message hides in different
+    // fields depending on which service (Gigya / OAuth / gateway) throttled us.
+    QString detail;
+    const QJsonObject obj = parseObject(body);
+    const QJsonObject response = obj.value(QStringLiteral("response")).toObject();
+    for (const char *key : {"message", "errorMessage", "error_description", "errorDesc"}) {
+        QString value = obj.value(QLatin1String(key)).toString();
+        if (value.isEmpty())
+            value = response.value(QLatin1String(key)).toString();
+        if (!value.isEmpty()) {
+            detail = value;
+            break;
+        }
+    }
+    if (detail.isEmpty())
+        detail = QString::fromUtf8(body.left(300));
+    qWarning().noquote() << "ConnectLife rate limited by" << what << "(HTTP" << httpStatus
+                         << "):" << detail;
+}
+
+bool ConnectLifeApi::rateLimited(QString *reason) const
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (m_backoffUntilMs <= now)
+        return false;
+    if (reason) {
+        const int secs = static_cast<int>((m_backoffUntilMs - now + 999) / 1000);
+        *reason = QStringLiteral("cloud API rate limited; backing off %1 s").arg(secs);
+    }
+    return true;
+}
+
 void ConnectLifeApi::postForm(
     const QString &url, const QVariantMap &form,
     const std::function<void(bool, const QJsonObject &, const QString &)> &cb)
@@ -211,11 +284,17 @@ void ConnectLifeApi::postForm(
     request.setRawHeader("User-Agent", kUserAgent);
 
     QNetworkReply *reply = m_net->post(request, query.toString(QUrl::FullyEncoded).toUtf8());
-    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, cb, url]() {
         const QByteArray body = reply->readAll();
         const bool ok = reply->error() == QNetworkReply::NoError;
+        QString error = reply->errorString();
+        noteRequestOutcome(QUrl(url).path(),
+                           reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(),
+                           body);
         reply->deleteLater();
-        cb(ok, parseObject(body), ok ? QString() : tr("network error"));
+        if (error.isEmpty())
+            error = tr("network error");
+        cb(ok, parseObject(body), ok ? QString() : error);
     });
 }
 
@@ -228,8 +307,11 @@ void ConnectLifeApi::postJson(
     request.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(kUserAgent));
 
     QNetworkReply *reply = m_net->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, cb, url]() {
         const QByteArray data = reply->readAll();
+        noteRequestOutcome(QUrl(url).path(),
+                           reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(),
+                           data);
         if (reply->error() != QNetworkReply::NoError) {
             cb(false, {}, reply->errorString());
         } else {
@@ -270,8 +352,10 @@ void ConnectLifeApi::getSigned(
     QNetworkRequest request(url);
     request.setRawHeader("User-Agent", kUserAgent);
     QNetworkReply *reply = m_net->get(request);
-    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, cb, path]() {
         const QByteArray body = reply->readAll();
+        noteRequestOutcome(path, reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(),
+                           body);
         if (reply->error() != QNetworkReply::NoError) {
             cb(false, {}, reply->errorString());
         } else {
@@ -301,8 +385,10 @@ void ConnectLifeApi::postSigned(
     request.setRawHeader("User-Agent", kUserAgent);
     QNetworkReply *reply =
         m_net->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, cb, path]() {
         const QByteArray data = reply->readAll();
+        noteRequestOutcome(path, reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(),
+                           data);
         if (reply->error() != QNetworkReply::NoError) {
             cb(false, {}, reply->errorString());
         } else {
@@ -328,6 +414,17 @@ void ConnectLifeApi::login(const TokenCallback &cb)
         return;
     }
 
+    // Single flight: a second request arriving while a login chain is already
+    // in progress just waits for its result instead of starting another one.
+    // Concurrent Gigya logins are rate-limited per IP and only slow everyone
+    // down (and can lock the daemon out of logging in at all).
+    if (m_loginInFlight) {
+        m_loginWaiters.append(cb);
+        return;
+    }
+    m_loginInFlight = true;
+    m_loginWaiters.append(cb);
+
     QVariantMap loginForm;
     loginForm.insert(QStringLiteral("loginID"), m_login);
     loginForm.insert(QStringLiteral("password"), m_password);
@@ -335,9 +432,9 @@ void ConnectLifeApi::login(const TokenCallback &cb)
     loginForm.insert(QStringLiteral("gmid"), QString::fromLatin1(kGmid));
 
     postForm(QString::fromLatin1(kGigyaUrl) + QStringLiteral("/accounts.login"), loginForm,
-             [this, cb](bool ok, const QJsonObject &json, const QString &error) {
+             [this](bool ok, const QJsonObject &json, const QString &error) {
                  if (!ok) {
-                     cb(false, {}, QStringLiteral("login failed: ") + error);
+                     finishLogin(false, {}, QStringLiteral("login failed: ") + error);
                      return;
                  }
                  const QString loginToken =
@@ -352,7 +449,7 @@ void ConnectLifeApi::login(const TokenCallback &cb)
                      QString detail = QStringLiteral("login failed");
                      if (code != 0 || !message.isEmpty())
                          detail += QStringLiteral(" (%1: %2)").arg(code).arg(message);
-                     cb(false, {}, detail);
+                     finishLogin(false, {}, detail);
                      return;
                  }
 
@@ -363,9 +460,9 @@ void ConnectLifeApi::login(const TokenCallback &cb)
 
                  postForm(QString::fromLatin1(kGigyaUrl) + QStringLiteral("/accounts.getJWT"),
                           jwtForm,
-                          [this, cb, uid](bool ok2, const QJsonObject &jwt, const QString &e2) {
+                          [this, uid](bool ok2, const QJsonObject &jwt, const QString &e2) {
                               if (!ok2) {
-                                  cb(false, {}, QStringLiteral("JWT failed: ") + e2);
+                                  finishLogin(false, {}, QStringLiteral("JWT failed: ") + e2);
                                   return;
                               }
                               QJsonObject auth;
@@ -383,18 +480,20 @@ void ConnectLifeApi::login(const TokenCallback &cb)
                               postJson(QString::fromLatin1(kOauthUrl)
                                            + QStringLiteral("/oauth/authorize"),
                                        auth,
-                                       [this, cb, uid](bool ok3, const QJsonObject &authResp,
-                                                       const QString &e3) {
+                                       [this](bool ok3, const QJsonObject &authResp,
+                                              const QString &e3) {
                                            if (!ok3) {
-                                               cb(false, {},
-                                                  QStringLiteral("authorize failed: ") + e3);
+                                               finishLogin(false, {},
+                                                           QStringLiteral("authorize failed: ")
+                                                               + e3);
                                                return;
                                            }
                                            const QString code =
                                                authResp.value(QStringLiteral("code")).toString();
                                            if (code.isEmpty()) {
-                                               cb(false, {},
-                                                  QStringLiteral("authorize failed: no code"));
+                                               finishLogin(false, {},
+                                                           QStringLiteral(
+                                                               "authorize failed: no code"));
                                                return;
                                            }
                                            QVariantMap tokenForm;
@@ -412,14 +511,15 @@ void ConnectLifeApi::login(const TokenCallback &cb)
                                            postForm(QString::fromLatin1(kOauthUrl)
                                                         + QStringLiteral("/oauth/token"),
                                                     tokenForm,
-                                                    [this, cb](bool ok4,
-                                                               const QJsonObject &tokenResp,
-                                                               const QString &e4) {
+                                                    [this](bool ok4,
+                                                           const QJsonObject &tokenResp,
+                                                           const QString &e4) {
                                                         if (!ok4) {
-                                                            cb(false, {},
-                                                               QStringLiteral(
-                                                                   "token exchange failed: ")
-                                                                   + e4);
+                                                            finishLogin(
+                                                                false, {},
+                                                                QStringLiteral(
+                                                                    "token exchange failed: ")
+                                                                    + e4);
                                                             return;
                                                         }
                                                         const QString token =
@@ -428,38 +528,107 @@ void ConnectLifeApi::login(const TokenCallback &cb)
                                                                     "access_token"))
                                                                 .toString();
                                                         if (token.isEmpty()) {
-                                                            cb(false, {},
-                                                               QStringLiteral(
-                                                                   "token exchange failed: no "
-                                                                   "access_token"));
+                                                            finishLogin(
+                                                                false, {},
+                                                                QStringLiteral(
+                                                                    "token exchange failed: no "
+                                                                    "access_token"));
                                                             return;
                                                         }
                                                         m_token = token;
+                                                        // Honour the advertised lifetime when
+                                                        // present so the token is refreshed
+                                                        // before it actually expires.
+                                                        const qint64 expiresIn =
+                                                            tokenResp
+                                                                .value(QStringLiteral(
+                                                                    "expires_in"))
+                                                                .toVariant()
+                                                                .toLongLong();
+                                                        const qint64 lifetime =
+                                                            expiresIn > 0 ? expiresIn
+                                                                          : kDefaultTokenLifetimeSec;
                                                         m_tokenExpiry =
                                                             QDateTime::currentDateTimeUtc()
-                                                                .addSecs(12 * 3600);
+                                                                .addSecs(qMax<qint64>(
+                                                                    kTokenSafetyMarginSec + 60,
+                                                                    lifetime
+                                                                        - kTokenSafetyMarginSec));
                                                         saveTokenCache();
-                                                        cb(true, token, QString());
+                                                        finishLogin(true, token, QString());
                                                     });
                                        });
                           });
              });
 }
 
+void ConnectLifeApi::finishLogin(bool ok, const QString &token, const QString &error)
+{
+    m_loginInFlight = false;
+    QList<TokenCallback> waiters;
+    waiters.swap(m_loginWaiters);
+    for (const TokenCallback &waiter : waiters)
+        waiter(ok, token, error);
+}
+
+void ConnectLifeApi::refreshToken(const TokenCallback &cb)
+{
+    // The token is not accepted (or stale); drop it and any cached copy so a
+    // failed re-login cannot leave the dead token behind for the next start.
+    m_token.clear();
+    m_tokenExpiry = QDateTime();
+    clearTokenCache();
+
+    // The user asked explicitly, so the defensive backoff must not swallow the
+    // attempt: clear it and let the login chain run. A real rate limit on the
+    // login endpoints will set the backoff again from the reply.
+    m_rateLimitHits = 0;
+    m_backoffUntilMs = 0;
+
+    // login() is single-flight: if a chain is already running our callback
+    // joins it instead of starting a second, rate-limited Gigya login.
+    login(cb);
+}
+
+void ConnectLifeApi::finishStatus(bool ok, const QJsonObject &device, const QString &error)
+{
+    m_statusInFlight = false;
+    QList<StatusCallback> waiters;
+    waiters.swap(m_statusWaiters);
+    for (const StatusCallback &waiter : waiters)
+        waiter(ok, device, error);
+}
+
 void ConnectLifeApi::fetchStatus(const StatusCallback &cb)
 {
-    withToken([this, cb](bool ok, const QString &token, const QString &error) {
+    // While backing off from a rate limit, fail fast instead of sending a
+    // request that would only extend the block.
+    QString reason;
+    if (rateLimited(&reason)) {
+        cb(false, {}, reason);
+        return;
+    }
+    // Single flight: overlapping reads (daemon timer, widget refresh,
+    // post-write reconcile) are coalesced onto one request.
+    if (m_statusInFlight) {
+        m_statusWaiters.append(cb);
+        return;
+    }
+    m_statusInFlight = true;
+    m_statusWaiters.append(cb);
+
+    withToken([this](bool ok, const QString &token, const QString &error) {
         if (!ok) {
-            cb(false, {}, error);
+            finishStatus(false, {}, error);
             return;
         }
         QVariantMap params = commonData();
         params.insert(QStringLiteral("accessToken"), token);
         getSigned(
             QStringLiteral("/clife-svc/pu/get_device_status_list"), params,
-            [this, cb](bool ok2, const QJsonObject &json, const QString &error2) {
+            [this](bool ok2, const QJsonObject &json, const QString &error2) {
                 if (!ok2) {
-                    cb(false, {}, error2);
+                    finishStatus(false, {}, error2);
                     return;
                 }
                 if (qEnvironmentVariableIsSet("HISENSE_CONNECTLIFE_DEBUG"))
@@ -476,7 +645,7 @@ void ConnectLifeApi::fetchStatus(const StatusCallback &cb)
                     QString detail = QStringLiteral("no devices returned");
                     if (code != 0 || !message.isEmpty())
                         detail += QStringLiteral(" (%1: %2)").arg(code).arg(message);
-                    cb(false, {}, detail);
+                    finishStatus(false, {}, detail);
                     return;
                 }
                 for (const QJsonValue &value : devices) {
@@ -489,22 +658,29 @@ void ConnectLifeApi::fetchStatus(const StatusCallback &cb)
                                            || type == QLatin1String("008");
                     if (!m_deviceId.isEmpty()) {
                         if (puid == m_deviceId) {
-                            cb(true, device, QString());
+                            finishStatus(true, device, QString());
                             return;
                         }
                     } else if (supported) {
                         m_deviceId = puid;
-                        cb(true, device, QString());
+                        finishStatus(true, device, QString());
                         return;
                     }
                 }
-                cb(false, {}, QStringLiteral("air conditioner not found in account"));
+                finishStatus(false, {}, QStringLiteral("air conditioner not found in account"));
             });
     });
 }
 
 void ConnectLifeApi::setProperties(const QVariantMap &properties, const SimpleCallback &cb)
 {
+    // Writes respect the backoff too: a rejected write would just extend the
+    // rate-limit window and the widget rolls back anyway.
+    QString reason;
+    if (rateLimited(&reason)) {
+        cb(false, reason);
+        return;
+    }
     withToken([this, properties, cb](bool ok, const QString &token, const QString &error) {
         if (!ok) {
             cb(false, error);
