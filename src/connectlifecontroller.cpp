@@ -19,11 +19,39 @@ ConnectLifeController::ConnectLifeController(ConnectLifeApi *api, QObject *paren
     m_writeTimer.setSingleShot(true);
     m_writeTimer.setInterval(800);
     connect(&m_writeTimer, &QTimer::timeout, this, &ConnectLifeController::flushWrite);
+
+    // Advance the exported login-retry countdown while Gigya blocks us. The
+    // timer is only active during a block.
+    m_loginRetryTimer.setInterval(10000);
+    connect(&m_loginRetryTimer, &QTimer::timeout, this, [this]() {
+        if (m_api->loginRetrySeconds() > 0) {
+            emit stateChanged();
+        } else {
+            m_loginRetryTimer.stop();
+            emit stateChanged();
+        }
+    });
+    syncLoginRetryTimer();
 }
 
 QString ConnectLifeController::deviceId() const
 {
     return m_api->deviceId();
+}
+
+int ConnectLifeController::loginRetryIn() const
+{
+    return m_api->loginRetrySeconds();
+}
+
+void ConnectLifeController::syncLoginRetryTimer()
+{
+    if (m_api->loginRetrySeconds() > 0) {
+        if (!m_loginRetryTimer.isActive())
+            m_loginRetryTimer.start();
+    } else if (m_loginRetryTimer.isActive()) {
+        m_loginRetryTimer.stop();
+    }
 }
 
 int ConnectLifeController::modeToCode(const QString &mode)
@@ -164,6 +192,7 @@ void ConnectLifeController::Refresh()
                 m_connected = false;
                 setError(error);
             }
+            syncLoginRetryTimer();
         });
 }
 
@@ -181,9 +210,11 @@ void ConnectLifeController::RefreshLogin()
         if (!ok) {
             m_lastError = error;
             emit stateChanged();
+            syncLoginRetryTimer();
             return;
         }
         emit stateChanged();
+        syncLoginRetryTimer();
         Refresh();
     });
 }

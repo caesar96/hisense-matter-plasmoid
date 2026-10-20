@@ -39,6 +39,7 @@ class ConnectLifeController : public QObject
     Q_PROPERTY(double Humidity READ humidity NOTIFY stateChanged)
     Q_PROPERTY(QString LastError READ lastError NOTIFY stateChanged)
     Q_PROPERTY(bool RefreshingLogin READ refreshingLogin NOTIFY stateChanged)
+    Q_PROPERTY(int LoginRetryIn READ loginRetryIn NOTIFY stateChanged)
     Q_PROPERTY(QString DeviceId READ deviceId CONSTANT)
 
 public:
@@ -59,6 +60,10 @@ public:
     double humidity() const { return m_humidity; }
     QString lastError() const { return m_lastError; }
     bool refreshingLogin() const { return m_refreshingLogin; }
+    // Seconds until Gigya allows a password login again (0 = not blocked).
+    // The widget renders this as a live countdown while the daemon refuses
+    // to send more login attempts.
+    int loginRetryIn() const;
     QString deviceId() const;
 
 public slots:
@@ -90,6 +95,9 @@ private:
     void flushWrite();
     void scheduleRefresh(int ms = 2500);
     void setError(const QString &error);
+    // Keeps a lightweight timer running while a Gigya login block is active so
+    // the exported LoginRetryIn countdown stays fresh.
+    void syncLoginRetryTimer();
 
     static int modeToCode(const QString &mode);
     static QString codeToMode(int code);
@@ -127,4 +135,8 @@ private:
     // that the cloud gateway rate-limits.
     QTimer m_writeTimer;
     QVariantMap m_pendingWrite;
+
+    // Ticks only while Gigya has us blocked, so the countdown exported to the
+    // widget advances without waking the daemon all the time.
+    QTimer m_loginRetryTimer;
 };

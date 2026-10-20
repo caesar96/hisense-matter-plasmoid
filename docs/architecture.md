@@ -201,14 +201,15 @@ Properties:
 | `Sleep`           | bool   | sleep toggle                                       |
 | `Humidity`        | double | room humidity, % (when reported)                   |
 | `LastError`       | string | last error, empty when healthy                     |
-| `RefreshingLogin` | bool   | a forced re-login is in progress                   |
+| `RefreshingLogin` | bool   | a forced token renewal/login is in progress        |
+| `LoginRetryIn`    | int    | seconds until Gigya allows another password login  |
 | `DeviceId`        | string | puid of the controlled unit (constant)             |
 
 Methods:
 
 ```
 Refresh()                       re-read the device status now
-RefreshLogin()                  drop the cached access token and log in again
+RefreshLogin()                  drop the access token and renew it (refresh token first)
 SetPower(bool on)               on -> last non-off mode (default cool)
 SetMode(string mode)            off|fan|heat|cool|dry|auto (off = power off)
 SetTemperature(double celsius)  setpoint; device display unit is preserved
@@ -239,11 +240,14 @@ panel's °F display is not clobbered.
 
 1. **Auth** – `accounts.login` on Gigya EU (login + password + app key) →
    `accounts.getJWT` → `oauth/authorize` → `oauth/token`, yielding a bearer
-   access token. The token is cached under
-   `~/.cache/hisenseac/connectlife-token.json` (mode `600`, lifetime from the
-   token endpoint, ~12 h fallback) so restarts do not re-login; Gigya
-   rate-limits repeated logins per IP, so logins are single-flight: concurrent
-   requests share the one login chain already in progress.
+   access token plus a **refresh token**. The access token lives about 24 min
+   (`expires_in` is 1440 s), so renewals use the OAuth token endpoint's
+   `grant_type=refresh_token`; the full Gigya password chain runs only when the
+   refresh token is missing, expired or rejected. Access and refresh tokens are
+   cached under `~/.cache/hisenseac/connectlife-token.json` (mode `600`), so
+   restarts do not log in again. Gigya rate-limits repeated password logins per
+   IP, so token acquisition is single-flight: concurrent requests share the one
+   refresh/login chain already in progress.
 2. **Read** – signed `GET /clife-svc/pu/get_device_status_list`; the daemon picks
    the unit matching the configured puid (or the only AC).
 3. **Write** – signed `POST /device/pu/property/set` with `t_power`,
@@ -264,18 +268,25 @@ on demand after a write; there is no push/subscription. The gateway throttles
 aggressive clients ("Api rate limit exceeded"), so the daemon defends itself:
 status reads are single-flight (overlapping refreshes share one request), writes
 are debounced and merged (800 ms, so a temperature-arc drag becomes a single
-property set instead of one request per step), and a rate-limited reply (HTTP 429
-or a rate-limit message in the body, from either the gateway or Gigya) puts the
-API into an exponential backoff (60 s doubling per hit, capped at 30 min) during
-which requests fail fast through `LastError` instead of being sent.
+property set instead of one request per step), and a rate-limited gateway reply
+(HTTP 429 or a rate-limit message in the body) puts the API into an exponential
+backoff (60 s doubling per hit, capped at 30 min) during which requests fail
+fast through `LastError` instead of being sent. A gateway reply with error
+`100026` (access token rejected) clears the cached access token, renews it, and
+retries the status request once.
 
-A cached token that the gateway no longer accepts produces that same
-"Api rate limit exceeded" reply. `RefreshLogin()` (the widget's **Refresh login**
-button) is the escape hatch: it drops the in-memory and on-disk token, resets
-the backoff so the attempt is not swallowed, and runs the login chain again
-(single-flight, so a concurrent request joins it instead of starting a second
-Gigya login). The controller exposes `RefreshingLogin` while it runs and
-re-reads the status once the login succeeds.
+Gigya's password-login limit is tracked **separately**: it starts at 15 min and
+doubles to 6 h, and is persisted in the token cache so a daemon restart does not
+immediately hit the blocked endpoint. While it is active, `RefreshLogin()` also
+fails fast with the remaining wait instead of sending another password login;
+`LoginRetryIn` lets the widget show a live countdown. A failed refresh-token
+attempt does not clear this block, but any successful token renewal does.
+
+`RefreshLogin()` (the widget's **Refresh login** button) is the escape hatch for
+a cached token the gateway no longer accepts: it drops the access token, clears
+the *gateway* backoff, and renews via the refresh token (or a full login when no
+refresh token is usable). The controller exposes `RefreshingLogin` while it runs
+and re-reads the status once the renewal succeeds.
 
 ## Limitations (Matter backend) carried over from the device
 

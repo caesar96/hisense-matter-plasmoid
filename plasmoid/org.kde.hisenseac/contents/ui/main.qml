@@ -44,6 +44,8 @@ PlasmoidItem {
     property real humidity: 0
     // While the daemon is signing in again after a manual "Refresh login".
     property bool refreshingLogin: false
+    // Seconds until Gigya allows another password login (0 = not blocked).
+    property int loginRetryIn: 0
     // The re-login action only appears when the daemon reports an error (and
     // while an attempt is in flight), so the normal popup stays clean.
     readonly property bool showRefreshLogin: isCloud
@@ -186,6 +188,7 @@ PlasmoidItem {
             lastError = p.LastError === undefined ? "" : String(p.LastError)
             deviceId = p.DeviceId === undefined ? "" : String(p.DeviceId)
             refreshingLogin = Boolean(p.RefreshingLogin)
+            loginRetryIn = _num(p.LoginRetryIn, 0)
 
             _devPower = Boolean(p.Power)
             _devMode = p.Mode === undefined ? "off" : String(p.Mode)
@@ -329,9 +332,17 @@ PlasmoidItem {
         _call(member, args, signature, function (m) { root.lastError = m })
     }
 
+    function retryLabel(seconds) {
+        if (seconds >= 120)
+            return qsTr("Retry in %1 min").arg(Math.ceil(seconds / 60))
+        return qsTr("Retry in %1 s").arg(seconds)
+    }
+
     // The gateway can start rejecting the cached token with a rate-limit
     // error even though it has not expired. Signing in again fetches a fresh
-    // token; the daemon clears its backoff so the attempt is not swallowed.
+    // token: the daemon first tries the OAuth refresh token and only falls
+    // back to a full login when necessary. While Gigya blocks password
+    // logins, the daemon reports the remaining wait instead of retrying.
     function refreshLogin() {
         if (refreshingLogin)
             return
@@ -1137,8 +1148,11 @@ PlasmoidItem {
                 Layout.fillWidth: true
                 flat: true
                 icon.name: "view-refresh"
-                text: root.refreshingLogin ? qsTr("Logging in\u2026") : qsTr("Refresh login")
+                text: root.refreshingLogin ? qsTr("Logging in\u2026")
+                    : (root.loginRetryIn > 0 ? root.retryLabel(root.loginRetryIn)
+                                             : qsTr("Refresh login"))
                 enabled: !root.refreshingLogin && root.lastError.length > 0
+                         && root.loginRetryIn === 0
                 onClicked: root.refreshLogin()
             }
         }

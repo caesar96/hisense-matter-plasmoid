@@ -153,15 +153,20 @@ backend (**Matter / ConnectLife cloud**) and use the switches to run only
 that daemon (the other will be stopped and disabled).
 
 The credentials are sent only to the ConnectLife/Higyu servers, exactly like the
-phone app. Requests are signed with the app's embedded RSA public key and the
-resulting access token is cached (mode `600`) until shortly before it expires
-(~12 h) so restarts do not re-login (Gigya rate-limits repeated logins).
+phone app. Requests are signed with the app's embedded RSA public key. The
+access token (about 24 min) and the OAuth **refresh token** are cached together
+under `~/.cache/hisenseac/connectlife-token.json` (mode `600`): the daemon renews
+the access token through `grant_type=refresh_token` and only performs a full
+password login when the refresh token is missing or no longer accepted. This
+avoids Gigya's per-IP login limit, which is easy to hit when every token expiry
+triggers another password login.
 
-The cached token can also go stale before its expiry and then make the gateway
-answer any request with "Api rate limit exceeded". A fresh login is the way out,
-so whenever the daemon reports an error the widget shows a **Refresh login**
-button (cloud backend only): it drops the cached token, clears the daemon's
-rate-limit backoff and signs in again.
+If Gigya does block password logins, the daemon refuses to send more attempts
+for a while instead of extending the block. The widget's **Refresh login**
+button (cloud backend only, shown while there is an error) first tries the
+refresh token; if a full login is needed and Gigya is blocking, the button shows
+a live **Retry in …** countdown. The login block is persisted across daemon
+restarts.
 
 CLI options:
 
@@ -259,8 +264,10 @@ feature the app can.
   the daemon appear at most one poll later. The gateway rate-limits aggressive
   clients ("Api rate limit exceeded"), so reads are coalesced, writes are
   debounced/merged and a rate-limited reply triggers an automatic exponential
-  backoff instead of more requests. If the error persists with a cached token,
-  use the widget's **Refresh login** button to force a fresh login.
+  backoff instead of more requests. A rejected access token (`100026`) is
+  renewed automatically and the request retried once. Gigya login blocks get a
+  separate, longer backoff; the widget's **Refresh login** button uses the OAuth
+  refresh token first and shows a countdown while password logins are blocked.
 
 ## Repository layout
 

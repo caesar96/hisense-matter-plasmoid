@@ -53,6 +53,16 @@ constexpr const char *kUserAgent = "Runner/2.0.6 (iPhone; iOS 17.2.1; Scale/3.00
 constexpr int kBackoffBaseSec = 60;
 constexpr int kBackoffMaxSec = 30 * 60;
 
+// Gigya blocks password logins per IP for much longer, and every retry can
+// extend the block. Start at 15 min and double up to 6 h; the refresh token
+// path is unaffected and normally avoids Gigya entirely.
+constexpr int kLoginBackoffBaseSec = 15 * 60;
+constexpr int kLoginBackoffMaxSec = 6 * 3600;
+
+// Gateway error code for "access token invalid/expired". The request can be
+// retried once after obtaining a new token.
+constexpr int kGatewayInvalidAccessToken = 100026;
+
 // Assumed token lifetime when the token endpoint does not say otherwise.
 constexpr int kDefaultTokenLifetimeSec = 12 * 3600;
 // Re-login shortly before the token actually dies so no request is sent with
@@ -99,12 +109,30 @@ void ConnectLifeApi::loadTokenCache()
     if (!file.open(QIODevice::ReadOnly))
         return;
     const QJsonObject json = QJsonDocument::fromJson(file.readAll()).object();
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+
     const QString token = json.value(QStringLiteral("accessToken")).toString();
     const QDateTime expiry = QDateTime::fromString(
         json.value(QStringLiteral("expiry")).toString(), Qt::ISODate);
-    if (!token.isEmpty() && expiry.isValid() && expiry > QDateTime::currentDateTimeUtc()) {
+    if (!token.isEmpty() && expiry.isValid() && expiry > now) {
         m_token = token;
         m_tokenExpiry = expiry;
+    }
+
+    // The refresh token is independent of the access token: keep it even when
+    // the access token has expired, since it is what avoids another login.
+    m_refreshToken = json.value(QStringLiteral("refreshToken")).toString();
+    m_refreshExpiry = QDateTime::fromString(
+        json.value(QStringLiteral("refreshExpiry")).toString(), Qt::ISODate);
+
+    // Persist the Gigya login block too, so restarting the daemon does not
+    // immediately hit the rate-limited login endpoint again.
+    const qint64 backoff = json.value(QStringLiteral("loginBackoffUntil"))
+                               .toVariant()
+                               .toLongLong();
+    if (backoff > now.toMSecsSinceEpoch()) {
+        m_loginBackoffUntilMs = backoff;
+        m_loginRateLimitHits = json.value(QStringLiteral("loginRateLimitHits")).toInt();
     }
 }
 
@@ -115,16 +143,16 @@ void ConnectLifeApi::saveTokenCache() const
     QJsonObject json;
     json.insert(QStringLiteral("accessToken"), m_token);
     json.insert(QStringLiteral("expiry"), m_tokenExpiry.toString(Qt::ISODate));
+    json.insert(QStringLiteral("refreshToken"), m_refreshToken);
+    if (m_refreshExpiry.isValid())
+        json.insert(QStringLiteral("refreshExpiry"), m_refreshExpiry.toString(Qt::ISODate));
+    json.insert(QStringLiteral("loginRateLimitHits"), m_loginRateLimitHits);
+    json.insert(QStringLiteral("loginBackoffUntil"), m_loginBackoffUntilMs);
     QFile file(path);
     if (file.open(QIODevice::WriteOnly)) {
         file.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
         file.write(QJsonDocument(json).toJson(QJsonDocument::Compact));
     }
-}
-
-void ConnectLifeApi::clearTokenCache() const
-{
-    QFile::remove(tokenCachePath());
 }
 
 void ConnectLifeApi::setDeviceId(const QString &puid)
@@ -225,18 +253,29 @@ bool ConnectLifeApi::looksRateLimited(int httpStatus, const QByteArray &body)
     return lower.contains("rate limit") || lower.contains("too many requests");
 }
 
+bool ConnectLifeApi::isAuthRequest(const QString &path)
+{
+    // Both the Gigya endpoints (/accounts.login, /accounts.getJWT) and the
+    // OAuth token exchange are subject to the login rate limit, which is much
+    // stricter and longer-lived than the gateway's.
+    return path.startsWith(QLatin1String("/accounts."))
+           || path.startsWith(QLatin1String("/oauth/"));
+}
+
 void ConnectLifeApi::noteRequestOutcome(const QString &what, int httpStatus,
                                         const QByteArray &body)
 {
+    const bool auth = isAuthRequest(what);
     if (!looksRateLimited(httpStatus, body)) {
-        m_rateLimitHits = 0;
-        m_backoffUntilMs = 0;
+        if (!auth) {
+            m_rateLimitHits = 0;
+            m_backoffUntilMs = 0;
+        }
+        // A successful auth request clears the login backoff in
+        // applyTokenResponse(). Do not clear it for other auth replies: an
+        // invalid refresh token must not bypass an active Gigya block.
         return;
     }
-    ++m_rateLimitHits;
-    const int shift = qMin(m_rateLimitHits - 1, 6);
-    const int seconds = qMin(kBackoffBaseSec << shift, kBackoffMaxSec);
-    m_backoffUntilMs = QDateTime::currentMSecsSinceEpoch() + qint64(seconds) * 1000;
 
     // Surface what the server actually said: the message hides in different
     // fields depending on which service (Gigya / OAuth / gateway) throttled us.
@@ -254,6 +293,21 @@ void ConnectLifeApi::noteRequestOutcome(const QString &what, int httpStatus,
     }
     if (detail.isEmpty())
         detail = QString::fromUtf8(body.left(300));
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (auth) {
+        ++m_loginRateLimitHits;
+        const int shift = qMin(m_loginRateLimitHits - 1, 6);
+        const int seconds = qMin(kLoginBackoffBaseSec << shift, kLoginBackoffMaxSec);
+        m_loginBackoffUntilMs = now + qint64(seconds) * 1000;
+        saveTokenCache();
+    } else {
+        ++m_rateLimitHits;
+        const int shift = qMin(m_rateLimitHits - 1, 6);
+        const int seconds = qMin(kBackoffBaseSec << shift, kBackoffMaxSec);
+        m_backoffUntilMs = now + qint64(seconds) * 1000;
+    }
+
     qWarning().noquote() << "ConnectLife rate limited by" << what << "(HTTP" << httpStatus
                          << "):" << detail;
 }
@@ -266,6 +320,29 @@ bool ConnectLifeApi::rateLimited(QString *reason) const
     if (reason) {
         const int secs = static_cast<int>((m_backoffUntilMs - now + 999) / 1000);
         *reason = QStringLiteral("cloud API rate limited; backing off %1 s").arg(secs);
+    }
+    return true;
+}
+
+int ConnectLifeApi::loginRetrySeconds() const
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (m_loginBackoffUntilMs <= now)
+        return 0;
+    return static_cast<int>((m_loginBackoffUntilMs - now + 999) / 1000);
+}
+
+bool ConnectLifeApi::loginRateLimited(QString *reason) const
+{
+    const int secs = loginRetrySeconds();
+    if (secs <= 0)
+        return false;
+    if (reason) {
+        if (secs >= 120)
+            *reason = QStringLiteral("Gigya login rate limited; retry in %1 min")
+                          .arg((secs + 59) / 60);
+        else
+            *reason = QStringLiteral("Gigya login rate limited; retry in %1 s").arg(secs);
     }
     return true;
 }
@@ -404,26 +481,88 @@ void ConnectLifeApi::withToken(const TokenCallback &cb)
         cb(true, m_token, QString());
         return;
     }
-    login(cb);
+    acquireToken(cb);
 }
 
-void ConnectLifeApi::login(const TokenCallback &cb)
+void ConnectLifeApi::acquireToken(const TokenCallback &cb)
 {
-    if (m_login.isEmpty() || m_password.isEmpty()) {
-        cb(false, {}, QStringLiteral("ConnectLife credentials are not configured"));
-        return;
-    }
-
-    // Single flight: a second request arriving while a login chain is already
+    // Single flight: a second request arriving while a token chain is already
     // in progress just waits for its result instead of starting another one.
     // Concurrent Gigya logins are rate-limited per IP and only slow everyone
     // down (and can lock the daemon out of logging in at all).
-    if (m_loginInFlight) {
-        m_loginWaiters.append(cb);
+    if (m_authInFlight) {
+        m_authWaiters.append(cb);
         return;
     }
-    m_loginInFlight = true;
-    m_loginWaiters.append(cb);
+    m_authInFlight = true;
+    m_authWaiters.append(cb);
+
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const bool canRefresh = !m_refreshToken.isEmpty()
+                            && (!m_refreshExpiry.isValid() || m_refreshExpiry > now);
+    if (canRefresh)
+        startTokenRefresh();
+    else
+        startLogin();
+}
+
+void ConnectLifeApi::startTokenRefresh()
+{
+    // Refresh tokens are issued by the OAuth endpoint alongside the access
+    // token. Using the refresh_token grant avoids Gigya's strict password
+    // login limit for the ~24 min lifetime of a gateway access token.
+    QVariantMap form;
+    form.insert(QStringLiteral("client_id"), QString::fromLatin1(kClientId));
+    form.insert(QStringLiteral("client_secret"), QString::fromLatin1(kClientSecret));
+    form.insert(QStringLiteral("redirect_uri"), QString::fromLatin1(kRedirectUri));
+    form.insert(QStringLiteral("grant_type"), QStringLiteral("refresh_token"));
+    form.insert(QStringLiteral("refresh_token"), m_refreshToken);
+
+    postForm(QString::fromLatin1(kOauthUrl) + QStringLiteral("/oauth/token"), form,
+             [this](bool ok, const QJsonObject &json, const QString &error) {
+                 if (!ok) {
+                     // Expired/revoked refresh token (or a transport error):
+                     // fall back to the full password login.
+                     qWarning().noquote()
+                         << "ConnectLife token refresh failed, logging in again:" << error;
+                     m_refreshToken.clear();
+                     m_refreshExpiry = QDateTime();
+                     saveTokenCache();
+                     startLogin();
+                     return;
+                 }
+                 QString detail;
+                 if (!applyTokenResponse(json, &detail)) {
+                     // A 200 reply without a token means the refresh token is
+                     // no longer usable; retry with the full login flow.
+                     qWarning().noquote()
+                         << "ConnectLife token refresh returned no token, logging in again:"
+                         << detail;
+                     m_refreshToken.clear();
+                     m_refreshExpiry = QDateTime();
+                     saveTokenCache();
+                     startLogin();
+                     return;
+                 }
+                 finishAuth(true, m_token, QString());
+             });
+}
+
+void ConnectLifeApi::startLogin()
+{
+    if (m_login.isEmpty() || m_password.isEmpty()) {
+        finishAuth(false, {}, QStringLiteral("ConnectLife credentials are not configured"));
+        return;
+    }
+
+    // Repeated attempts extend Gigya's IP block; report the remaining wait
+    // instead of sending another password login.
+    QString reason;
+    if (loginRateLimited(&reason)) {
+        qInfo().noquote() << "ConnectLife login skipped:" << reason;
+        finishAuth(false, {}, reason);
+        return;
+    }
 
     QVariantMap loginForm;
     loginForm.insert(QStringLiteral("loginID"), m_login);
@@ -434,7 +573,7 @@ void ConnectLifeApi::login(const TokenCallback &cb)
     postForm(QString::fromLatin1(kGigyaUrl) + QStringLiteral("/accounts.login"), loginForm,
              [this](bool ok, const QJsonObject &json, const QString &error) {
                  if (!ok) {
-                     finishLogin(false, {}, QStringLiteral("login failed: ") + error);
+                     finishAuth(false, {}, QStringLiteral("login failed: ") + error);
                      return;
                  }
                  const QString loginToken =
@@ -449,7 +588,7 @@ void ConnectLifeApi::login(const TokenCallback &cb)
                      QString detail = QStringLiteral("login failed");
                      if (code != 0 || !message.isEmpty())
                          detail += QStringLiteral(" (%1: %2)").arg(code).arg(message);
-                     finishLogin(false, {}, detail);
+                     finishAuth(false, {}, detail);
                      return;
                  }
 
@@ -462,7 +601,7 @@ void ConnectLifeApi::login(const TokenCallback &cb)
                           jwtForm,
                           [this, uid](bool ok2, const QJsonObject &jwt, const QString &e2) {
                               if (!ok2) {
-                                  finishLogin(false, {}, QStringLiteral("JWT failed: ") + e2);
+                                  finishAuth(false, {}, QStringLiteral("JWT failed: ") + e2);
                                   return;
                               }
                               QJsonObject auth;
@@ -483,7 +622,7 @@ void ConnectLifeApi::login(const TokenCallback &cb)
                                        [this](bool ok3, const QJsonObject &authResp,
                                               const QString &e3) {
                                            if (!ok3) {
-                                               finishLogin(false, {},
+                                               finishAuth(false, {},
                                                            QStringLiteral("authorize failed: ")
                                                                + e3);
                                                return;
@@ -491,7 +630,7 @@ void ConnectLifeApi::login(const TokenCallback &cb)
                                            const QString code =
                                                authResp.value(QStringLiteral("code")).toString();
                                            if (code.isEmpty()) {
-                                               finishLogin(false, {},
+                                               finishAuth(false, {},
                                                            QStringLiteral(
                                                                "authorize failed: no code"));
                                                return;
@@ -515,79 +654,109 @@ void ConnectLifeApi::login(const TokenCallback &cb)
                                                            const QJsonObject &tokenResp,
                                                            const QString &e4) {
                                                         if (!ok4) {
-                                                            finishLogin(
+                                                            finishAuth(
                                                                 false, {},
                                                                 QStringLiteral(
                                                                     "token exchange failed: ")
                                                                     + e4);
                                                             return;
                                                         }
-                                                        const QString token =
-                                                            tokenResp
-                                                                .value(QStringLiteral(
-                                                                    "access_token"))
-                                                                .toString();
-                                                        if (token.isEmpty()) {
-                                                            finishLogin(
+                                                        QString detail;
+                                                        if (!applyTokenResponse(tokenResp,
+                                                                                &detail)) {
+                                                            finishAuth(
                                                                 false, {},
                                                                 QStringLiteral(
-                                                                    "token exchange failed: no "
-                                                                    "access_token"));
+                                                                    "token exchange failed: ")
+                                                                    + detail);
                                                             return;
                                                         }
-                                                        m_token = token;
-                                                        // Honour the advertised lifetime when
-                                                        // present so the token is refreshed
-                                                        // before it actually expires.
-                                                        const qint64 expiresIn =
-                                                            tokenResp
-                                                                .value(QStringLiteral(
-                                                                    "expires_in"))
-                                                                .toVariant()
-                                                                .toLongLong();
-                                                        const qint64 lifetime =
-                                                            expiresIn > 0 ? expiresIn
-                                                                          : kDefaultTokenLifetimeSec;
-                                                        m_tokenExpiry =
-                                                            QDateTime::currentDateTimeUtc()
-                                                                .addSecs(qMax<qint64>(
-                                                                    kTokenSafetyMarginSec + 60,
-                                                                    lifetime
-                                                                        - kTokenSafetyMarginSec));
-                                                        saveTokenCache();
-                                                        finishLogin(true, token, QString());
+                                                        finishAuth(true, m_token, QString());
                                                     });
                                        });
                           });
              });
 }
 
-void ConnectLifeApi::finishLogin(bool ok, const QString &token, const QString &error)
+void ConnectLifeApi::finishAuth(bool ok, const QString &token, const QString &error)
 {
-    m_loginInFlight = false;
+    m_authInFlight = false;
     QList<TokenCallback> waiters;
-    waiters.swap(m_loginWaiters);
+    waiters.swap(m_authWaiters);
     for (const TokenCallback &waiter : waiters)
         waiter(ok, token, error);
 }
 
+bool ConnectLifeApi::applyTokenResponse(const QJsonObject &response, QString *error)
+{
+    const QString token = response.value(QStringLiteral("access_token")).toString();
+    if (token.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("no access_token");
+        return false;
+    }
+
+    m_token = token;
+    // Honour the advertised lifetime (the gateway currently returns 1440 s)
+    // so the token is refreshed before it actually expires.
+    const qint64 expiresIn =
+        response.value(QStringLiteral("expires_in")).toVariant().toLongLong();
+    const qint64 lifetime = expiresIn > 0 ? expiresIn : kDefaultTokenLifetimeSec;
+    m_tokenExpiry = QDateTime::currentDateTimeUtc().addSecs(qMax<qint64>(
+        kTokenSafetyMarginSec + 60, lifetime - kTokenSafetyMarginSec));
+
+    // Keep the refresh token; it lets later renewals skip Gigya entirely.
+    const QString refresh = response.value(QStringLiteral("refresh_token")).toString();
+    if (!refresh.isEmpty())
+        m_refreshToken = refresh;
+
+    // refreshTokenExpiredTime is epoch milliseconds on some servers and an ISO
+    // timestamp on others. Missing/invalid means "no known expiry".
+    const QJsonValue refreshExpiry =
+        response.value(QStringLiteral("refreshTokenExpiredTime"));
+    if (!refreshExpiry.isUndefined() && !refreshExpiry.isNull()) {
+        QDateTime expiry;
+        if (refreshExpiry.isDouble()) {
+            expiry = QDateTime::fromMSecsSinceEpoch(
+                         refreshExpiry.toVariant().toLongLong())
+                         .toUTC();
+        } else {
+            const QString text = refreshExpiry.toString();
+            bool numeric = false;
+            const qint64 ms = text.toLongLong(&numeric);
+            if (numeric)
+                expiry = QDateTime::fromMSecsSinceEpoch(ms).toUTC();
+            else
+                expiry = QDateTime::fromString(text, Qt::ISODate).toUTC();
+        }
+        if (expiry.isValid())
+            m_refreshExpiry = expiry;
+    }
+
+    // Any successful token acquisition proves the login block has lifted.
+    m_loginRateLimitHits = 0;
+    m_loginBackoffUntilMs = 0;
+
+    saveTokenCache();
+    return true;
+}
+
 void ConnectLifeApi::refreshToken(const TokenCallback &cb)
 {
-    // The token is not accepted (or stale); drop it and any cached copy so a
-    // failed re-login cannot leave the dead token behind for the next start.
+    // Force a new access token, but keep the refresh token and its cache
+    // entry: the OAuth token endpoint is not subject to Gigya's password-login
+    // limit and is the normal way to renew.
     m_token.clear();
     m_tokenExpiry = QDateTime();
-    clearTokenCache();
+    saveTokenCache();
 
-    // The user asked explicitly, so the defensive backoff must not swallow the
-    // attempt: clear it and let the login chain run. A real rate limit on the
-    // login endpoints will set the backoff again from the reply.
+    // The user asked explicitly, so the gateway backoff must not swallow the
+    // retry. The Gigya login backoff is deliberately kept: overriding it with
+    // every click would only extend the block.
     m_rateLimitHits = 0;
     m_backoffUntilMs = 0;
 
-    // login() is single-flight: if a chain is already running our callback
-    // joins it instead of starting a second, rate-limited Gigya login.
-    login(cb);
+    acquireToken(cb);
 }
 
 void ConnectLifeApi::finishStatus(bool ok, const QJsonObject &device, const QString &error)
@@ -617,7 +786,12 @@ void ConnectLifeApi::fetchStatus(const StatusCallback &cb)
     m_statusInFlight = true;
     m_statusWaiters.append(cb);
 
-    withToken([this](bool ok, const QString &token, const QString &error) {
+    fetchStatusOnce(true);
+}
+
+void ConnectLifeApi::fetchStatusOnce(bool retryOnAuth)
+{
+    withToken([this, retryOnAuth](bool ok, const QString &token, const QString &error) {
         if (!ok) {
             finishStatus(false, {}, error);
             return;
@@ -626,7 +800,7 @@ void ConnectLifeApi::fetchStatus(const StatusCallback &cb)
         params.insert(QStringLiteral("accessToken"), token);
         getSigned(
             QStringLiteral("/clife-svc/pu/get_device_status_list"), params,
-            [this](bool ok2, const QJsonObject &json, const QString &error2) {
+            [this, retryOnAuth](bool ok2, const QJsonObject &json, const QString &error2) {
                 if (!ok2) {
                     finishStatus(false, {}, error2);
                     return;
@@ -638,14 +812,36 @@ void ConnectLifeApi::fetchStatus(const StatusCallback &cb)
                     json.value(QStringLiteral("response")).toObject();
                 const QJsonArray devices =
                     response.value(QStringLiteral("deviceList")).toArray();
+                const int resultCode =
+                    response.value(QStringLiteral("resultCode")).toInt(0);
+                const int errorCode = response.value(QStringLiteral("errorCode")).toInt(0);
+                if (resultCode != 0 || errorCode != 0) {
+                    if (retryOnAuth && errorCode == kGatewayInvalidAccessToken) {
+                        // The cached token is no longer accepted. Drop it so
+                        // withToken() uses the refresh token (or logs in) and
+                        // retry this one request.
+                        qWarning() << "ConnectLife gateway rejected the access token;"
+                                      " refreshing and retrying";
+                        m_token.clear();
+                        m_tokenExpiry = QDateTime();
+                        saveTokenCache();
+                        QString reason;
+                        if (rateLimited(&reason)) {
+                            finishStatus(false, {}, reason);
+                            return;
+                        }
+                        fetchStatusOnce(false);
+                        return;
+                    }
+                    const QString desc = response.value(QStringLiteral("errorDesc")).toString();
+                    finishStatus(false, {},
+                                 QStringLiteral("gateway error (%1: %2)")
+                                     .arg(errorCode != 0 ? errorCode : resultCode)
+                                     .arg(desc.isEmpty() ? QStringLiteral("unknown") : desc));
+                    return;
+                }
                 if (devices.isEmpty()) {
-                    const int code = response.value(QStringLiteral("code")).toInt();
-                    const QString message =
-                        response.value(QStringLiteral("message")).toString();
-                    QString detail = QStringLiteral("no devices returned");
-                    if (code != 0 || !message.isEmpty())
-                        detail += QStringLiteral(" (%1: %2)").arg(code).arg(message);
-                    finishStatus(false, {}, detail);
+                    finishStatus(false, {}, QStringLiteral("no devices returned"));
                     return;
                 }
                 for (const QJsonValue &value : devices) {
