@@ -58,11 +58,11 @@ public:
     // Writes a subset of the AC properties (t_power, t_work_mode, t_temp, ...).
     void setProperties(const QVariantMap &properties, const SimpleCallback &cb);
 
-    // Discards the current access token and obtains a new one. The OAuth
-    // refresh token is used when available, so this normally does not hit
-    // Gigya's password-login endpoint at all; otherwise a full login runs.
-    // The login rate-limit backoff is respected (unlike the gateway backoff,
-    // which is cleared so the retry is not swallowed).
+    // Obtains a new access token without discarding the current one until the
+    // renewal succeeds. The OAuth refresh token is used when available, so this
+    // normally does not hit Gigya's password-login endpoint at all; otherwise a
+    // full login runs. The login rate-limit backoff is respected (unlike the
+    // gateway backoff, which is cleared so the retry is not swallowed).
     void refreshToken(const TokenCallback &cb);
 
     // Seconds until a Gigya login is allowed again (0 = not blocked).

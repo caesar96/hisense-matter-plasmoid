@@ -743,13 +743,11 @@ bool ConnectLifeApi::applyTokenResponse(const QJsonObject &response, QString *er
 
 void ConnectLifeApi::refreshToken(const TokenCallback &cb)
 {
-    // Force a new access token, but keep the refresh token and its cache
-    // entry: the OAuth token endpoint is not subject to Gigya's password-login
-    // limit and is the normal way to renew.
-    m_token.clear();
-    m_tokenExpiry = QDateTime();
-    saveTokenCache();
-
+    // Do not discard the current access token before the new one is in hand.
+    // If the renewal fails (for example because Gigya blocks the login), the
+    // daemon keeps working with the token it already has. applyTokenResponse()
+    // replaces it on success.
+    //
     // The user asked explicitly, so the gateway backoff must not swallow the
     // retry. The Gigya login backoff is deliberately kept: overriding it with
     // every click would only extend the block.

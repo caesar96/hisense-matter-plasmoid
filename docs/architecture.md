@@ -283,10 +283,12 @@ fails fast with the remaining wait instead of sending another password login;
 attempt does not clear this block, but any successful token renewal does.
 
 `RefreshLogin()` (the widget's **Refresh login** button) is the escape hatch for
-a cached token the gateway no longer accepts: it drops the access token, clears
-the *gateway* backoff, and renews via the refresh token (or a full login when no
-refresh token is usable). The controller exposes `RefreshingLogin` while it runs
-and re-reads the status once the renewal succeeds.
+a cached token the gateway no longer accepts: it clears the *gateway* backoff
+and renews via the refresh token (or a full login when no refresh token is
+usable). The current access token is only replaced once the renewal succeeds, so
+a failed attempt does not knock a working daemon offline. The controller exposes
+`RefreshingLogin` while it runs and re-reads the status once the renewal
+succeeds.
 
 ## Limitations (Matter backend) carried over from the device
 
