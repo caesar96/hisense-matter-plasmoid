@@ -521,13 +521,11 @@ void ConnectLifeApi::startTokenRefresh()
     postForm(QString::fromLatin1(kOauthUrl) + QStringLiteral("/oauth/token"), form,
              [this](bool ok, const QJsonObject &json, const QString &error) {
                  if (!ok) {
-                     // Expired/revoked refresh token (or a transport error):
-                     // fall back to the full password login.
+                     // Expired/revoked refresh token, or a transport error.
+                     // Keep it: the failure may be transient, and a successful
+                     // fallback login replaces it with a fresh one anyway.
                      qWarning().noquote()
                          << "ConnectLife token refresh failed, logging in again:" << error;
-                     m_refreshToken.clear();
-                     m_refreshExpiry = QDateTime();
-                     saveTokenCache();
                      startLogin();
                      return;
                  }
@@ -538,9 +536,6 @@ void ConnectLifeApi::startTokenRefresh()
                      qWarning().noquote()
                          << "ConnectLife token refresh returned no token, logging in again:"
                          << detail;
-                     m_refreshToken.clear();
-                     m_refreshExpiry = QDateTime();
-                     saveTokenCache();
                      startLogin();
                      return;
                  }
